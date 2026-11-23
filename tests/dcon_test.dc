@@ -1,0 +1,624 @@
+module dcon_test;
+
+import std::fmt;
+import dconp::dcon;
+
+using dconp::dcon::{ Document, ParseError, ErrorKind, Kind, Node };
+
+i32 failures = 0;
+i32 checks = 0;
+
+void check(bool ok, [] const char what) {
+    checks = checks + 1;
+    if !ok {
+        failures = failures + 1;
+        println("FAIL {}", what).is_ok();
+    }
+}
+
+bool same([] const char a, [] const char b) {
+    if a.len != b.len {
+        return false;
+    }
+
+    for usize i = 0; i < a.len; i++ {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool string_is(Optional(const Node*) node, [] const char want) {
+    if node.is_none() {
+        return false;
+    }
+
+    Optional([] const char) text = node.unwrap_some().as_string();
+    return text.is_some() && same(text.unwrap_some(), want);
+}
+
+bool integer_is(Optional(const Node*) node, i64 want) {
+    if node.is_none() {
+        return false;
+    }
+
+    Optional(i64) value = node.unwrap_some().as_integer();
+    return value.is_some() && value.unwrap_some() == want;
+}
+
+bool bool_is(Optional(const Node*) node, bool want) {
+    if node.is_none() {
+        return false;
+    }
+
+    Optional(bool) value = node.unwrap_some().as_bool();
+    return value.is_some() && value.unwrap_some() == want;
+}
+
+/// parses `{ v = <expr> }` and compares the integer it folds to.
+void folds_to([] const char text, i64 want) {
+    Result(Document(), ParseError) parsed = dconp::dcon::parse(text);
+    if parsed.is_err() {
+        check(false, text);
+        return;
+    }
+
+    Document() doc = parsed.unwrap();
+    defer doc.deinit();
+    check(integer_is(doc.root.get("v"), want), text);
+}
+
+void fails_with([] const char text, ErrorKind kind, u32 line, u32 column) {
+    Result(Document(), ParseError) parsed = dconp::dcon::parse(text);
+    if parsed.is_ok() {
+        Document() doc = parsed.unwrap();
+        doc.deinit();
+        check(false, text);
+        return;
+    }
+
+    ParseError error = parsed.unwrap_err();
+    bool ok = error.kind == kind
+        && error.at.line == line
+        && error.at.column == column;
+
+    if !ok {
+        println(
+            "  got '{}' at {}:{}",
+            dconp::dcon::describe(error.kind),
+            error.at.line,
+            error.at.column
+        ).is_ok();
+    }
+    check(ok, text);
+}
+
+/// parses `text`, writes it with `indent` and compares with `want`.
+void writes_as([] const char text, u32 indent, [] const char want) {
+    Result(Document(), ParseError) parsed = dconp::dcon::parse(text);
+    if parsed.is_err() {
+        check(false, text);
+        return;
+    }
+
+    Document() doc = parsed.unwrap();
+    defer doc.deinit();
+
+    char[2048] buffer;
+    std::fmt::BufferWriter writer = std::fmt::new_buffer_writer(buffer[0..2048]);
+    bool written = dconp::dcon::write(&writer, &doc.root, indent).is_ok();
+    bool ok = written && same(writer.written_slice(), want);
+    if !ok {
+        println("  got <{}>", writer.written_slice()).is_ok();
+    }
+
+    check(ok, text);
+}
+
+void test_manifest() {
+    [] const char text =
+    \\// a project file
+        \\const []const char base = "github.com/you";
+        \\
+        \\dpm::v1::Project {
+        \\    name = "game",
+        \\    version = "0.1.0",
+        \\    link = { "SDL3", "m" },
+        \\    dependencies = {
+        \\        { location = "github.com/you/dc_sdl3", version = "0.1.0" },
+        \\        { location = base, version = "2.0.0", dev = true },
+        \\    },
+        \\    products = { { name = "game", kind = dpm::v1::Kind::Executable } },
+        \\    settings = { optimize = Optimize::O2, extra_flags = {} },
+        \\    /* nested /* block */ comment */
+        \\    jobs = 4,
+        \\}
+    ;
+
+    Result(Document(), ParseError) parsed = dconp::dcon::parse(text);
+    check(parsed.is_ok(), "manifest parses");
+    if parsed.is_err() {
+        return;
+    }
+    Document() doc = parsed.unwrap();
+    defer doc.deinit();
+
+    const Node* root = &doc.root;
+    check(root.kind == Kind::Struct, "root is a struct");
+    check(same(root.type_name(), "dpm::v1::Project"), "root type");
+    check(root.len() == 7, "root field count");
+    check(root.at.line == 4 && root.at.column == 1, "root position");
+    check(string_is(root.get("name"), "game"), "name");
+    check(same(root.get_string("version").some_or(""), "0.1.0"), "get_string");
+    check(root.get_integer("jobs").some_or(0) == 4, "get_integer");
+    check(root.get("missing").is_none(), "missing field");
+    check(root.get_string("jobs").is_none(), "get_string on an integer");
+    check(
+        same(root.fields[2].name, "link") && root.fields[2].at.line == 7,
+        "field order and position"
+    );
+
+    Optional(const Node*) link = root.get("link");
+    check(
+        link.is_some()
+            && link.unwrap_some().kind == Kind::List
+            && link.unwrap_some().len() == 2,
+        "link is a list"
+    );
+    if link.is_some() {
+        check(string_is(link.unwrap_some().item(1), "m"), "link[1]");
+        check(link.unwrap_some().item(2).is_none(), "link[2] is out of range");
+        check(link.unwrap_some().get("x").is_none(), "get on a list");
+    }
+
+    Optional(const Node*) deps = root.get("dependencies");
+    check(deps.is_some() && deps.unwrap_some().len() == 2, "two dependencies");
+    if deps.is_some() && deps.unwrap_some().len() == 2 {
+        const Node* second = &deps.unwrap_some().items[1];
+        check(
+            second.kind == Kind::Struct && same(second.type_name(), ""),
+            "untyped struct"
+        );
+        check(
+            string_is(second.get("location"), "github.com/you"),
+            "constant substituted"
+        );
+        check(
+            second.get("location").unwrap_some().at.line == 10,
+            "constant located at its use"
+        );
+        check(second.get_bool("dev").some_or(false), "get_bool");
+    }
+
+    Optional(const Node*) products = root.get("products");
+    if products.is_some() && products.unwrap_some().len() == 1 {
+        Optional(const Node*) kind = products.unwrap_some().items[0].get("kind");
+        check(
+            kind.is_some() && kind.unwrap_some().kind == Kind::Enum,
+            "enum kind"
+        );
+        if kind.is_some() {
+            check(
+                same(kind.unwrap_some().as_enum().some_or(""), "dpm::v1::Kind::Executable"),
+                "enum path"
+            );
+            check(
+                same(kind.unwrap_some().variant().some_or(""), "Executable"),
+                "enum variant"
+            );
+            check(kind.unwrap_some().is_variant("Executable"), "is_variant");
+            check(
+                !kind.unwrap_some().is_variant("Kind"),
+                "is_variant on a prefix"
+            );
+        }
+    } else {
+        check(false, "one product");
+    }
+
+    Optional(const Node*) settings = root.get("settings");
+    if settings.is_some() {
+        Optional(const Node*) flags = settings.unwrap_some().get("extra_flags");
+        check(
+            flags.is_some()
+                && flags.unwrap_some().kind == Kind::List
+                && flags.unwrap_some().len() == 0,
+            "empty braces are an empty list"
+        );
+    } else {
+        check(false, "settings");
+    }
+}
+
+void test_expressions() {
+    folds_to("{ v = 1 + 2 * 3 }", 7);
+    folds_to("{ v = (1 + 2) * 3 }", 9);
+    folds_to("{ v = 10 - 4 - 3 }", 3);
+    folds_to("{ v = 7 / 2 + 7 % 4 }", 6);
+    folds_to("{ v = -7 / 2 }", -3);
+    folds_to("{ v = 1 << 4 | 1 }", 17);
+    folds_to("{ v = 6 & 3 ^ 1 }", 3);
+    folds_to("{ v = ~0 }", -1);
+    folds_to("{ v = - -5 }", 5);
+    folds_to("{ v = 0xFF + 0b101 + 0o17 + 1_000 }", 1275);
+    folds_to("{ v = 9223372036854775807 }", 9223372036854775807);
+    folds_to("{ v = -9223372036854775808 + 1 }", -9223372036854775807);
+    folds_to("{ v = 256 >> 4 }", 16);
+
+    Result(Document(), ParseError) parsed = dconp::dcon::parse(
+        "{ a = 1 < 2 && 3 >= 3, b = !true || 1 == 2, d = 1.5 + 2.25, e = -2.0e2, f = 3, g = 1.5 < 2.5 }"
+    );
+    check(parsed.is_ok(), "boolean and float expressions parse");
+    if parsed.is_ok() {
+        Document() doc = parsed.unwrap();
+        defer doc.deinit();
+        check(bool_is(doc.root.get("a"), true), "comparison and &&");
+        check(bool_is(doc.root.get("b"), false), "! and ||");
+        check(doc.root.get_float("d").some_or(0.0) == 3.75, "float addition");
+        check(
+            doc.root.get_float("e").some_or(0.0) == -200.0,
+            "float exponent and negation"
+        );
+        check(
+            doc.root.get_float("f").some_or(0.0) == 3.0,
+            "integer widens to float"
+        );
+        check(doc.root.get_integer("d").is_none(), "float does not narrow");
+        check(bool_is(doc.root.get("g"), true), "float comparison");
+    }
+}
+
+void test_characters() {
+    Result(Document(), ParseError) parsed = dconp::dcon::parse(
+        "{ a = 'A', b = '\\n', c = '\\u{20AC}', d = '\\xff', e = 'a' < 'b', f = '\u{e9}' }"
+    );
+    check(parsed.is_ok(), "character literals parse");
+    if parsed.is_err() {
+        return;
+    }
+    Document() doc = parsed.unwrap();
+    defer doc.deinit();
+
+    check(doc.root.get("a").unwrap_some().kind == Kind::Char, "character kind");
+    check(
+        doc.root.get("a").unwrap_some().as_char().some_or(0) == 65,
+        "plain character"
+    );
+    check(
+        doc.root.get("a").unwrap_some().as_integer().is_none(),
+        "a character is not an integer"
+    );
+    check(
+        doc.root.get("b").unwrap_some().as_char().some_or(0) == 10,
+        "escaped character"
+    );
+    check(
+        doc.root.get("c").unwrap_some().as_char().some_or(0) == 0x20AC,
+        "unicode escape character"
+    );
+    check(
+        doc.root.get("d").unwrap_some().as_char().some_or(0) == 255,
+        "byte escape character"
+    );
+    check(bool_is(doc.root.get("e"), true), "character comparison");
+    check(
+        doc.root.get("f").unwrap_some().as_char().some_or(0) == 0xE9,
+        "multibyte character"
+    );
+}
+
+void test_constants() {
+    [] const char text =
+    \\const i32 total = width * 2;
+        \\const i32 width = 21;
+        \\const Dependency dep = { location = "a/b", version = "1.2.3" };
+        \\const []const []const char flags = { "-g", "-O2" };
+        \\const bool debug = !release;
+        \\const bool release = false;
+        \\{
+        \\    total = total,
+        \\    first = dep,
+        \\    version = dep.version,
+        \\    flags = flags,
+        \\    debug,
+        \\    Named { 1, 2 },
+        \\}
+    ;
+
+    Result(Document(), ParseError) parsed = dconp::dcon::parse(text);
+    check(parsed.is_ok(), "constants parse");
+    if parsed.is_err() {
+        println(
+            "  got '{}' at {}:{}",
+            dconp::dcon::describe(parsed.unwrap_err().kind),
+            parsed.unwrap_err().at.line,
+            parsed.unwrap_err().at.column
+        ).is_ok();
+        return;
+    }
+    Document() doc = parsed.unwrap();
+    defer doc.deinit();
+
+    const Node* root = &doc.root;
+    check(integer_is(root.get("total"), 42), "forward reference");
+    Optional(const Node*) first = root.get("first");
+    check(
+        first.is_some()
+            && same(first.unwrap_some().type_name(), "Dependency"),
+        "constant keeps its declared type"
+    );
+    check(string_is(root.get("version"), "1.2.3"), "field access");
+    check(
+        root.get("flags").is_some()
+            && root.get("flags").unwrap_some().len() == 2,
+        "list constant"
+    );
+    check(bool_is(root.get("debug"), true), "shorthand field");
+    check(
+        root.len() == 6 && root.fields[5].name.len == 0,
+        "positional entry in a struct"
+    );
+    if root.len() == 6 {
+        const Node* named = &root.fields[5].value;
+        check(
+            named.kind == Kind::Struct
+                && same(named.type_name(), "Named")
+                && integer_is(named.item(1), 2),
+            "typed positional literal"
+        );
+    }
+}
+
+void test_strings() {
+    Result(Document(), ParseError) parsed = dconp::dcon::parse(
+        "{ a = \"tab\\t\\\"q\\\" \\x41\\u{e9}\\0\", b = \"one\" /* c */ \" two\"\n  \"!\", c =\n    \\\\first \\n raw\n    \\\\\n    \\\\last\n, d = \"\" }"
+    );
+    check(parsed.is_ok(), "strings parse");
+    if parsed.is_err() {
+        return;
+    }
+    Document() doc = parsed.unwrap();
+    defer doc.deinit();
+
+    check(string_is(doc.root.get("a"), "tab\t\"q\" A\u{e9}\0"), "escapes");
+    check(string_is(doc.root.get("b"), "one two!"), "adjacent literals");
+    check(
+        string_is(doc.root.get("c"), "first \\n raw\n\nlast"),
+        "multiline literal"
+    );
+    check(string_is(doc.root.get("d"), ""), "empty string");
+}
+
+void test_shapes() {
+    Result(Document(), ParseError) parsed = dconp::dcon::parse(
+        "{ a = { 1 }, b = { 1, 2, }, c = { x = 1, 2 }, d = T {}, e = { { } } }"
+    );
+    check(parsed.is_ok(), "shapes parse");
+    if parsed.is_err() {
+        return;
+    }
+    Document() doc = parsed.unwrap();
+    defer doc.deinit();
+
+    const Node* a = doc.root.get("a").unwrap_some();
+    check(a.kind == Kind::List && a.len() == 1, "single element list");
+    const Node* b = doc.root.get("b").unwrap_some();
+    check(b.kind == Kind::List && b.len() == 2, "trailing comma");
+    const Node* c = doc.root.get("c").unwrap_some();
+    check(
+        c.kind == Kind::Struct && c.len() == 2 && integer_is(c.item(1), 2),
+        "mixed entries"
+    );
+    const Node* d = doc.root.get("d").unwrap_some();
+    check(
+        d.kind == Kind::Struct && d.len() == 0 && same(d.type_name(), "T"),
+        "typed empty struct"
+    );
+    const Node* e = doc.root.get("e").unwrap_some();
+    check(
+        e.kind == Kind::List && e.len() == 1 && e.items[0].kind == Kind::List,
+        "nested lists"
+    );
+}
+
+void test_errors() {
+    fails_with("", ErrorKind::ExpectedStructLiteral, 1, 1);
+    fails_with("42", ErrorKind::ExpectedStructLiteral, 1, 1);
+    fails_with("Kind::A", ErrorKind::ExpectedStructLiteral, 1, 1);
+    fails_with("{ a = 1 } x", ErrorKind::TrailingTokens, 1, 11);
+    fails_with("{ a = 1 };", ErrorKind::InvalidDeclaration, 1, 1);
+    fails_with("const x = 1; {}", ErrorKind::InvalidDeclaration, 1, 1);
+    fails_with("const i32 x; {}", ErrorKind::InvalidDeclaration, 1, 1);
+    fails_with(
+        "const i32 x = 1; const i32 x = 2; {}",
+        ErrorKind::DuplicateConstant,
+        1,
+        28
+    );
+    fails_with("{ a = 1,\n  a = 2 }", ErrorKind::DuplicateField, 2, 3);
+    fails_with("{ a = b }", ErrorKind::UnknownName, 1, 7);
+    fails_with(
+        "const i32 a = b; const i32 b = a; {}",
+        ErrorKind::CyclicConstant,
+        1,
+        32
+    );
+    fails_with(
+        "const P p = { x = 1 }; { a = p.y }",
+        ErrorKind::UnknownField,
+        1,
+        32
+    );
+    fails_with("{ a = 1", ErrorKind::UnexpectedEnd, 1, 8);
+    fails_with("{ a = }", ErrorKind::UnexpectedToken, 1, 7);
+    fails_with("{ a = 1 b = 2 }", ErrorKind::UnexpectedToken, 1, 9);
+    fails_with("{ a = +1 }", ErrorKind::UnexpectedToken, 1, 7);
+    fails_with("{ a = \"x }", ErrorKind::UnterminatedString, 1, 7);
+    fails_with("{ a = \"\\q\" }", ErrorKind::InvalidEscape, 1, 8);
+    fails_with("{ a = \"\\u{D800}\" }", ErrorKind::InvalidEscape, 1, 8);
+    fails_with("{ a = '' }", ErrorKind::InvalidCharacter, 1, 7);
+    fails_with("{ a = 'ab' }", ErrorKind::InvalidCharacter, 1, 7);
+    fails_with("{ /* open", ErrorKind::UnterminatedComment, 1, 3);
+    fails_with("{ a = 0x }", ErrorKind::InvalidNumber, 1, 7);
+    fails_with("{ a = 1e }", ErrorKind::InvalidNumber, 1, 7);
+    fails_with("{ a = 9223372036854775808 }", ErrorKind::NumberOutOfRange, 1, 7);
+    fails_with(
+        "{ a = 99999999999999999999 }",
+        ErrorKind::NumberOutOfRange,
+        1,
+        7
+    );
+    fails_with("{ a = 1e999 }", ErrorKind::NumberOutOfRange, 1, 7);
+    fails_with("{ a = 9223372036854775807 + 1 }", ErrorKind::Overflow, 1, 27);
+    fails_with("{ a = 1 << 64 }", ErrorKind::Overflow, 1, 9);
+    fails_with("{ a = 1 / 0 }", ErrorKind::DivisionByZero, 1, 9);
+    fails_with("{ a = 1 + true }", ErrorKind::TypeMismatch, 1, 9);
+    fails_with("{ a = 'A' + 1 }", ErrorKind::TypeMismatch, 1, 11);
+    fails_with("{ a = 'A' + 'B' }", ErrorKind::TypeMismatch, 1, 11);
+    fails_with("{ a = 1 | 2 == 3 }", ErrorKind::TypeMismatch, 1, 9);
+    fails_with("{ a = 1.0e308 * 10.0 }", ErrorKind::Overflow, 1, 15);
+    fails_with("{ a = -\"x\" }", ErrorKind::TypeMismatch, 1, 7);
+    fails_with("{ a = \"x\" == \"x\" }", ErrorKind::TypeMismatch, 1, 11);
+    fails_with("{ a = f(1) }", ErrorKind::UnknownName, 1, 7);
+    fails_with("{ a = m::f(1) }", ErrorKind::NotAllowed, 1, 11);
+    fails_with("{ a = 1 as u8 }", ErrorKind::NotAllowed, 1, 9);
+    fails_with("{ a = null }", ErrorKind::NotAllowed, 1, 7);
+    fails_with("{ a = if true { 1 } else { 2 } }", ErrorKind::NotAllowed, 1, 7);
+    fails_with("{ a = u\"wide\" }", ErrorKind::NotAllowed, 1, 7);
+    fails_with("{ a = { 1 }[0] }", ErrorKind::NotAllowed, 1, 12);
+    fails_with("{ a = 1 ` 2 }", ErrorKind::UnexpectedByte, 1, 9);
+    fails_with("{ a = \"\0\" }", ErrorKind::NulByte, 1, 8);
+    fails_with("{ a = \"\xff\" }", ErrorKind::InvalidUtf8, 1, 8);
+    fails_with(
+        "{ a = ((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((1",
+        ErrorKind::DepthExceeded,
+        1,
+        135
+    );
+}
+
+void test_writer() {
+    writes_as(
+        "T { a = 1, b = { \"x\", \"y\" }, c = { k = K::V, 2 }, d = {}, e = true }",
+        0,
+        "T { a = 1, b = { \"x\", \"y\" }, c = { k = K::V, 2 }, d = {}, e = true }"
+    );
+    writes_as(
+        "T { a = 1, b = { \"x\" }, c = { k = -2 } }",
+        4,
+        "T {\n    a = 1,\n    b = {\n        \"x\",\n    },\n    c = {\n        k = -2,\n    },\n}"
+    );
+    writes_as(
+        "{ s = \"q\\\" b\\\\ n\\n t\\t z\\0 e\\x1b h\\xff u\\u{e9}\" }",
+        0,
+        "{ s = \"q\\\" b\\\\ n\\n t\\t z\\x00 e\\x1b h\\xff u\u{e9}\" }"
+    );
+
+    writes_as(
+        "{ 'A', '\\'', '\\\\', '\\n', '\\0', '\\xff', '\\u{20AC}' }",
+        0,
+        "{ 'A', '\\'', '\\\\', '\\n', '\\x00', '\\xff', '\\u{20ac}' }"
+    );
+
+    Result(Document(), ParseError) parsed = dconp::dcon::parse(
+        "{ f = 0.1, g = 1.0e100, h = 2.5, i = -9223372036854775808 }"
+    );
+    check(parsed.is_ok(), "numbers parse");
+    if parsed.is_err() {
+        return;
+    }
+    Document() doc = parsed.unwrap();
+    defer doc.deinit();
+
+    char[512] buffer;
+    std::fmt::BufferWriter writer = std::fmt::new_buffer_writer(buffer[0..512]);
+    check(
+        dconp::dcon::write(&writer, &doc.root, 2).is_ok(),
+        "numbers are written"
+    );
+
+    Result(Document(), ParseError) again = dconp::dcon::parse(
+        writer.written_slice()
+    );
+    check(again.is_ok(), "written numbers parse");
+    if again.is_ok() {
+        Document() copy = again.unwrap();
+        defer copy.deinit();
+        check(
+            copy.root.get_float("f").some_or(0.0) == doc.root.get_float("f").some_or(1.0),
+            "0.1 survives"
+        );
+        check(
+            copy.root.get_float("g").some_or(0.0) == doc.root.get_float("g").some_or(1.0),
+            "1e100 survives"
+        );
+        check(copy.root.get_float("h").some_or(0.0) == 2.5, "2.5 survives");
+        check(
+            copy.root.get("h").unwrap_some().kind == Kind::Float,
+            "a float stays a float"
+        );
+        check(
+            copy.root.get_integer("i").some_or(0) == doc.root.get_integer("i").some_or(1),
+            "i64 minimum survives"
+        );
+    }
+}
+
+void test_large() {
+    Array(char) text = {};
+    defer text.deinit();
+
+    bool built = std::fmt::format(&text, "{{ items = {{").is_ok();
+    for i32 i = 0; i < 2000; i++ {
+        built = built && std::fmt::format(
+            &text,
+            " {{ id = {}, name = \"item number {}\" }},",
+            i,
+            i
+        ).is_ok();
+    }
+    built = built && std::fmt::format(&text, " }} }}").is_ok();
+    check(built, "large input built");
+
+    Result(Document(), ParseError) parsed = dconp::dcon::parse(text.items());
+    check(parsed.is_ok(), "large input parses");
+    if parsed.is_err() {
+        return;
+    }
+    Document() doc = parsed.unwrap();
+    defer doc.deinit();
+
+    Optional(const Node*) items = doc.root.get("items");
+    check(
+        items.is_some() && items.unwrap_some().len() == 2000,
+        "large list length"
+    );
+    if items.is_some() && items.unwrap_some().len() == 2000 {
+        const Node* last = &items.unwrap_some().items[1999];
+        check(
+            integer_is(last.get("id"), 1999)
+                && string_is(last.get("name"), "item number 1999"),
+            "large list contents"
+        );
+    }
+
+    doc.deinit();
+    check(doc.root.len() == 0, "deinit twice is safe");
+}
+
+public i32 main() {
+    test_manifest();
+    test_expressions();
+    test_characters();
+    test_constants();
+    test_strings();
+    test_shapes();
+    test_errors();
+    test_writer();
+    test_large();
+
+    println("{} checks, {} failed", checks, failures).is_ok();
+    return failures;
+}

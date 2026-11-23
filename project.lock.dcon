@@ -1,0 +1,4 @@
+dpm::v1::Lock {
+    manifest = "sha256:96c8c3a866c3bb3ebc239a67d45f55f7bd0f7ad1ee410d6bffb9a030ba0d7aa0",
+    packages = {},
+}

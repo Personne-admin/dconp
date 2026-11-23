@@ -1,0 +1,2968 @@
+//!!
+//!! DC Object Notation (DCON)
+//!!
+//!! DCON is the data notation of `project.dcon` and the other dpm files: any
+//!! number of `const` declarations followed by one struct literal, written
+//!! in DC syntax.
+//!!
+//!! ```
+//!! const []const char base = "github.com/you";
+//!!
+//!! dpm::v1::Project {
+//!!     name = "game",
+//!!     version = "0.1.0",
+//!!     link = { "SDL3", "m" },
+//!!     products = { { name = "game", kind = Kind::Executable } },
+//!! }
+//!! ```
+//!!
+//!! - `{ name = value, ... }` and `Type { ... }` are a `Struct`, in source
+//!!   order. A positional entry of a struct has an empty name.
+//!! - `{ a, b }` and `{}` are a `List`.
+//!! - a path such as `Kind::Executable` is an `Enum` holding the path as
+//!!   written.
+//!! - constants are substituted and constant expressions are folded with
+//!!   the operators dpm accepts. Integers are `i64` and overflow is an
+//!!   error. Character literals stay characters, as in DC.
+//!!
+//!! `parse` returns a `Document` that owns the tree and copies every
+//!! string, so the input may be released. `deinit` frees it.
+//!!
+
+module dconp::dcon @no_prelude;
+
+import core;
+import core::allocator_config;
+import core::slice;
+import std::alloc;
+public import std::fmt;
+import std::utf8;
+public import std::parse;
+public import std::result;
+
+using std::result::{ Result, Status, Optional };
+using std::alloc::AllocatorPolicy;
+using std::parse::Position;
+
+//!
+//! Errors
+//!
+
+public enum ErrorKind : u8 {
+    /// the input is not valid UTF-8
+    InvalidUtf8,
+    /// the input contains a NUL byte
+    NulByte,
+    /// a byte that starts no token
+    UnexpectedByte,
+    UnterminatedComment,
+    UnterminatedString,
+    InvalidEscape,
+    /// an empty, unterminated or overlong character literal
+    InvalidCharacter,
+    InvalidNumber,
+    /// an integer outside i64, or a float outside f64
+    NumberOutOfRange,
+    UnexpectedToken,
+    UnexpectedEnd,
+    /// only `const TYPE NAME = VALUE;` may precede the value
+    InvalidDeclaration,
+    /// the value of a file must be a struct literal
+    ExpectedStructLiteral,
+    /// something follows the value
+    TrailingTokens,
+    DuplicateConstant,
+    DuplicateField,
+    /// a name that is not a declared constant
+    UnknownName,
+    /// `.name` on a struct without that field
+    UnknownField,
+    /// a constant that depends on itself
+    CyclicConstant,
+    /// calls, casts, indexing, `null`, `if`, `match`, lambdas, UTF-16
+    /// literals and the address operators are not data
+    NotAllowed,
+    /// an operator applied to values it is not defined for
+    TypeMismatch,
+    DivisionByZero,
+    /// arithmetic left i64 or f64, or a shift count outside 0..63
+    Overflow,
+    /// nesting deeper than `MAX_DEPTH`
+    DepthExceeded,
+    OutOfMemory,
+}
+
+/// what went wrong and where. `at` is the first byte of the offending token;
+/// columns count bytes.
+public struct ParseError {
+    ErrorKind kind;
+    Position at;
+}
+
+/// a short English description of `kind`, without a trailing period.
+public [] const char describe(ErrorKind kind) {
+    if kind == ErrorKind::InvalidUtf8 {
+        return "the input is not valid UTF-8";
+    }
+
+    if kind == ErrorKind::NulByte {
+        return "the input contains a NUL byte";
+    }
+
+    if kind == ErrorKind::UnexpectedByte {
+        return "unexpected byte";
+    }
+
+    if kind == ErrorKind::UnterminatedComment {
+        return "unterminated block comment";
+    }
+
+    if kind == ErrorKind::UnterminatedString {
+        return "unterminated string literal";
+    }
+
+    if kind == ErrorKind::InvalidEscape {
+        return "invalid escape sequence";
+    }
+
+    if kind == ErrorKind::InvalidCharacter {
+        return "invalid character literal";
+    }
+
+    if kind == ErrorKind::InvalidNumber {
+        return "invalid number";
+    }
+
+    if kind == ErrorKind::NumberOutOfRange {
+        return "number out of range";
+    }
+
+    if kind == ErrorKind::UnexpectedToken {
+        return "unexpected token";
+    }
+
+    if kind == ErrorKind::UnexpectedEnd {
+        return "unexpected end of input";
+    }
+
+    if kind == ErrorKind::InvalidDeclaration {
+        return "only 'const TYPE NAME = VALUE;' declarations are allowed before the value";
+    }
+
+    if kind == ErrorKind::ExpectedStructLiteral {
+        return "expected a struct literal";
+    }
+
+    if kind == ErrorKind::TrailingTokens {
+        return "unexpected tokens after the value";
+    }
+
+    if kind == ErrorKind::DuplicateConstant {
+        return "constant declared twice";
+    }
+
+    if kind == ErrorKind::DuplicateField {
+        return "field initialized twice";
+    }
+
+    if kind == ErrorKind::UnknownName {
+        return "unknown name";
+    }
+
+    if kind == ErrorKind::UnknownField {
+        return "unknown field";
+    }
+
+    if kind == ErrorKind::CyclicConstant {
+        return "constant depends on itself";
+    }
+
+    if kind == ErrorKind::NotAllowed {
+        return "this expression is not allowed in DCON";
+    }
+
+    if kind == ErrorKind::TypeMismatch {
+        return "operator applied to mismatched values";
+    }
+
+    if kind == ErrorKind::DivisionByZero {
+        return "division by zero";
+    }
+
+    if kind == ErrorKind::Overflow {
+        return "arithmetic overflow";
+    }
+
+    if kind == ErrorKind::DepthExceeded {
+        return "nesting too deep";
+    }
+
+    return "out of memory";
+}
+
+//!
+//! Tree
+//!
+
+public enum Kind : u8 {
+    /// `fields` holds the entries in source order; `text` the type path, or
+    /// nothing for an untyped literal
+    Struct,
+    /// `items` holds the elements
+    List,
+    /// `text` holds the decoded bytes
+    String,
+    /// `integer` holds the value
+    Integer,
+    /// `number` holds the value
+    Float,
+    /// `boolean` holds the value
+    Bool,
+    /// `text` holds the path as written, such as `Kind::Executable`
+    Enum,
+    /// a character literal. `integer` holds its codepoint, or the byte of
+    /// a `\x` escape. as in DC it is not an integer: it compares with
+    /// other characters and takes no arithmetic.
+    Char,
+}
+
+public struct Node {
+    Kind kind;
+    /// where the value is written. a value that came from a constant is
+    /// located where the constant is used.
+    Position at;
+    [] const char text;
+    i64 integer;
+    f64 number;
+    bool boolean;
+    [] Field fields;
+    [] Node items;
+}
+
+public struct Field {
+    /// empty for a positional entry
+    [] const char name;
+    Node value;
+    /// where the entry begins
+    Position at;
+}
+
+/// an owned tree. stores the allocator by value so `deinit` can release it.
+public struct Document(A = DefaultAllocator) if AllocatorPolicy(A) {
+    A alloc;
+    Node root;
+    [] u8 chunks;
+}
+
+/// values, parentheses and constants may nest this deep.
+public using usize MAX_DEPTH = 128;
+
+//!
+//! Tokens
+//!
+
+enum Tok : u8 {
+    End,
+    Ident,
+    Keyword,
+    Const,
+    As,
+    True,
+    False,
+    Null,
+    Int,
+    Char,
+    Float,
+    String,
+    Multiline,
+    LBrace,
+    RBrace,
+    LParen,
+    RParen,
+    LBracket,
+    RBracket,
+    Comma,
+    Semicolon,
+    Eq,
+    ColonColon,
+    Dot,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
+    Amp,
+    Pipe,
+    Caret,
+    AmpAmp,
+    PipePipe,
+    EqEq,
+    BangEq,
+    Lt,
+    Gt,
+    LtEq,
+    GtEq,
+    LtLt,
+    GtGt,
+    Bang,
+    Tilde,
+    Other,
+}
+
+struct Token {
+    Tok kind;
+    Position at;
+    usize end;
+    u64 magnitude;
+    f64 number;
+}
+
+struct Constant {
+    [] const char name;
+    [] const char type_name;
+    /// first token of the initializer
+    Position start;
+    /// 0 not evaluated, 1 being evaluated, 2 evaluated
+    u8 state;
+    Node value;
+}
+
+struct Parser {
+    [] const char input;
+    /// the byte after `tok`
+    Position at;
+    Token tok;
+    Position error_at;
+    usize depth;
+
+    /// newest arena chunk and the bytes used in it. each chunk starts with
+    /// a `ChunkHeader` naming the one before.
+    [] u8 chunk;
+    usize used;
+
+    /// entries of the literals being parsed, innermost last
+    [] Field stack;
+    usize stack_len;
+    /// the string or path being assembled
+    [] char text;
+    usize text_len;
+    [] Constant consts;
+    usize const_count;
+}
+
+struct Escape {
+    u32 value;
+    /// a single byte rather than a codepoint to encode
+    bool byte;
+}
+
+using u64 U64_MAX = 0xFFFFFFFFFFFFFFFF;
+using i64 I64_MAX = 9223372036854775807;
+using usize USIZE_MAX = ~(0 as usize);
+using usize MANTISSA_DIGITS = 19;
+using f64 F64_MAX = 1.7976931348623157e308;
+
+ErrorKind fail(Parser* p, ErrorKind kind, Position at) {
+    p.error_at = at;
+    return kind;
+}
+
+bool text_eq([] const char a, [] const char b) {
+    if a.len != b.len {
+        return false;
+    }
+
+    for usize i = 0; i < a.len; i++ {
+        if a[i] != b[i] {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+//!
+//! Lexer
+//!
+//! Follows the compiler's lexer: the same comments, number forms, escapes
+//! and multiline strings, so a file dpm accepts lexes the same way here.
+//!
+
+char byte_at(const Parser* p, usize offset) {
+    if offset >= p.input.len {
+        return '\0';
+    }
+
+    return p.input[offset];
+}
+
+bool at_end(const Parser* p) {
+    return p.at.offset >= p.input.len;
+}
+
+char peek(const Parser* p) {
+    return byte_at(p, p.at.offset);
+}
+
+char take(Parser* p) {
+    char b = p.input[p.at.offset];
+    std::parse::advance(&p.at, b);
+    return b;
+}
+
+bool is_digit(char c) {
+    return c >= '0' && c <= '9';
+}
+
+bool is_ident_start(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+bool is_ident_continue(char c) {
+    return is_ident_start(c) || is_digit(c);
+}
+
+/// value of a digit in any base up to 16, or 99.
+u32 digit_value(char c) {
+    if c >= '0' && c <= '9' {
+        return c as u32 - 0x30;
+    }
+
+    if c >= 'a' && c <= 'f' {
+        return c as u32 - 0x61 + 10;
+    }
+
+    if c >= 'A' && c <= 'F' {
+        return c as u32 - 0x41 + 10;
+    }
+
+    return 99;
+}
+
+Status(ErrorKind) skip_trivia(Parser* p) {
+    while !at_end(p) {
+        char c = peek(p);
+        char n = byte_at(p, p.at.offset + 1);
+
+        if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+            take(p);
+            continue;
+        }
+
+        if c == '/' && n == '/' {
+            while !at_end(p) && peek(p) != '\n' {
+                take(p);
+            }
+            continue;
+        }
+
+        if c == '/' && n == '*' {
+            Position start = p.at;
+            take(p);
+            take(p);
+            usize depth = 1;
+
+            while depth > 0 {
+                if at_end(p) {
+                    return fail(p, ErrorKind::UnterminatedComment, start);
+                }
+
+                char a = take(p);
+                if a == '/' && peek(p) == '*' {
+                    take(p);
+                    depth = depth + 1;
+                } else if a == '*' && peek(p) == '/' {
+                    take(p);
+                    depth = depth - 1;
+                }
+            }
+            continue;
+        }
+
+        break;
+    }
+
+    return Status::Ok;
+}
+
+/// reads the escape whose backslash is just before `*cursor` and moves the
+/// cursor past it. None when it is malformed.
+Optional(Escape) scan_escape([] const char text, usize* cursor) {
+    usize i = *cursor;
+    if i >= text.len {
+        return Optional::None;
+    }
+
+    char c = text[i];
+    i++;
+    Escape e = {value = 0, byte = true};
+
+    if c == 'n' {
+        e.value = 0x0A;
+    } else if c == 't' {
+        e.value = 0x09;
+    } else if c == 'r' {
+        e.value = 0x0D;
+    } else if c == '0' {
+        e.value = 0;
+    } else if c == '\\' || c == '\'' || c == '"' {
+        e.value = c as u32;
+    } else if c == 'x' {
+        if i + 2 > text.len {
+            return Optional::None;
+        }
+
+        u32 high = digit_value(text[i]);
+        u32 low = digit_value(text[i + 1]);
+        if high > 15 || low > 15 {
+            return Optional::None;
+        }
+
+        e.value = (high << 4) | low;
+        i = i + 2;
+    } else if c == 'u' {
+        if i >= text.len || text[i] != '{' {
+            return Optional::None;
+        }
+        i++;
+
+        u32 codepoint = 0;
+        usize digits = 0;
+        while i < text.len && text[i] != '}' {
+            u32 digit = digit_value(text[i]);
+            if digit > 15 || digits == 6 {
+                return Optional::None;
+            }
+
+            codepoint = (codepoint << 4) | digit;
+            digits++;
+            i++;
+        }
+
+        if i >= text.len || digits == 0 {
+            return Optional::None;
+        }
+        i++;
+
+        if codepoint > 0x10FFFF || (codepoint >= 0xD800 && codepoint <= 0xDFFF) {
+            return Optional::None;
+        }
+
+        e.value = codepoint;
+        e.byte = false;
+    } else {
+        return Optional::None;
+    }
+
+    *cursor = i;
+    return Optional::Some(e);
+}
+
+/// consumes the escape at the cursor, which is on its backslash.
+Result(Escape, ErrorKind) lex_escape(Parser* p) {
+    Position start = p.at;
+    usize i = p.at.offset + 1;
+
+    Optional(Escape) e = scan_escape(p.input, &i);
+    if e.is_none() {
+        return fail(p, ErrorKind::InvalidEscape, start);
+    }
+
+    while p.at.offset < i {
+        take(p);
+    }
+
+    return Result::Ok(e.unwrap_some());
+}
+
+Status(ErrorKind) lex_string(Parser* p) {
+    Position start = p.at;
+    take(p);
+
+    while true {
+        if at_end(p) || peek(p) == '\n' {
+            return fail(p, ErrorKind::UnterminatedString, start);
+        }
+
+        char c = peek(p);
+        if c == '"' {
+            take(p);
+            return Status::Ok;
+        }
+
+        if c == '\\' {
+            lex_escape(p) ?;
+            continue;
+        }
+
+        take(p);
+    }
+}
+
+Result(u32, ErrorKind) lex_char(Parser* p) {
+    Position start = p.at;
+    take(p);
+
+    if at_end(p) || peek(p) == '\'' {
+        return fail(p, ErrorKind::InvalidCharacter, start);
+    }
+
+    u32 value = 0;
+    if peek(p) == '\\' {
+        Escape e = lex_escape(p) ?;
+        value = e.value;
+    } else {
+        Result(std::utf8::Decoded, std::utf8::Utf8Error) decoded = std::utf8::decode(
+            p.input[p.at.offset..p.input.len]
+        );
+        if decoded.is_err() {
+            return fail(p, ErrorKind::InvalidCharacter, start);
+        }
+
+        std::utf8::Decoded d = decoded.unwrap();
+        value = d.codepoint;
+        for usize i = 0; i < d.width; i++ {
+            take(p);
+        }
+    }
+
+    if peek(p) != '\'' {
+        return fail(p, ErrorKind::InvalidCharacter, start);
+    }
+
+    take(p);
+    return Result::Ok(value);
+}
+
+/// true when only spaces and tabs precede the cursor on its line.
+bool at_line_start(const Parser* p) {
+    usize i = p.at.offset;
+
+    while i > 0 {
+        char c = p.input[i - 1];
+        if c == '\n' || c == '\r' {
+            return true;
+        }
+
+        if c != ' ' && c != '\t' {
+            return false;
+        }
+
+        i--;
+    }
+
+    return true;
+}
+
+/// consumes consecutive `\\` lines, leaving the cursor at the end of the
+/// last one.
+void lex_multiline(Parser* p) {
+    while true {
+        take(p);
+        take(p);
+        while !at_end(p) && peek(p) != '\r' && peek(p) != '\n' {
+            take(p);
+        }
+
+        Position end = p.at;
+        if peek(p) == '\r' {
+            take(p);
+        }
+        if peek(p) == '\n' {
+            take(p);
+        }
+        while peek(p) == ' ' || peek(p) == '\t' {
+            take(p);
+        }
+
+        if peek(p) != '\\' || byte_at(p, p.at.offset + 1) != '\\' || !at_line_start(
+            p
+        ) {
+            p.at = end;
+            return;
+        }
+    }
+}
+
+/// value of a decimal float token, underscores included.
+Result(f64, std::parse::NumError) float_value([] const char text) {
+    usize i = 0;
+    u64 mantissa = 0;
+    usize taken = 0;
+    i32 exponent = 0;
+
+    while i < text.len && (is_digit(text[i]) || text[i] == '_') {
+        if text[i] != '_' {
+            if taken < MANTISSA_DIGITS {
+                mantissa = mantissa * 10 + digit_value(text[i]) as u64;
+                taken++;
+            } else {
+                // past the precision f64 can hold; keep the magnitude only
+                exponent = exponent + 1;
+            }
+        }
+        i++;
+    }
+
+    if i < text.len && text[i] == '.' {
+        i++;
+        while i < text.len && (is_digit(text[i]) || text[i] == '_') {
+            if text[i] != '_' && taken < MANTISSA_DIGITS {
+                mantissa = mantissa * 10 + digit_value(text[i]) as u64;
+                taken++;
+                exponent = exponent - 1;
+            }
+            i++;
+        }
+    }
+
+    if i < text.len && (text[i] == 'e' || text[i] == 'E') {
+        i++;
+
+        bool negative = false;
+        if i < text.len && (text[i] == '+' || text[i] == '-') {
+            negative = text[i] == '-';
+            i++;
+        }
+
+        i32 written = 0;
+        while i < text.len {
+            // clamp rather than wrap: anything past this overflows or
+            // underflows the result whatever the exact value
+            if text[i] != '_' && written < 100000 {
+                written = written * 10 + digit_value(text[i]) as i32;
+            }
+            i++;
+        }
+
+        exponent = exponent + if negative {
+            0 - written
+        } else {
+            written
+        };
+    }
+
+    return std::parse::float_from_parts(mantissa, exponent, false);
+}
+
+Status(ErrorKind) lex_number(Parser* p, Token* t) {
+    Position start = p.at;
+
+    if peek(p) == '0' {
+        char r = byte_at(p, p.at.offset + 1);
+        u32 base = 0;
+        if r == 'x' || r == 'X' {
+            base = 16;
+        } else if r == 'b' || r == 'B' {
+            base = 2;
+        } else if r == 'o' || r == 'O' {
+            base = 8;
+        }
+
+        if base != 0 {
+            take(p);
+            take(p);
+            if digit_value(peek(p)) >= base {
+                return fail(p, ErrorKind::InvalidNumber, start);
+            }
+
+            u64 value = 0;
+            while true {
+                char d = peek(p);
+                if d == '_' {
+                    take(p);
+                    continue;
+                }
+
+                u32 digit = digit_value(d);
+                if digit >= base {
+                    break;
+                }
+
+                if value > (U64_MAX - digit as u64) / base as u64 {
+                    return fail(p, ErrorKind::NumberOutOfRange, start);
+                }
+
+                value = value * base as u64 + digit as u64;
+                take(p);
+            }
+
+            t.kind = Tok::Int;
+            t.magnitude = value;
+            return Status::Ok;
+        }
+    }
+
+    while is_digit(peek(p)) || peek(p) == '_' {
+        take(p);
+    }
+
+    bool is_float = false;
+    if peek(p) == '.' && is_digit(byte_at(p, p.at.offset + 1)) {
+        is_float = true;
+        take(p);
+        while is_digit(peek(p)) || peek(p) == '_' {
+            take(p);
+        }
+    }
+
+    if peek(p) == 'e' || peek(p) == 'E' {
+        is_float = true;
+        take(p);
+        if peek(p) == '+' || peek(p) == '-' {
+            take(p);
+        }
+
+        if !is_digit(peek(p)) {
+            return fail(p, ErrorKind::InvalidNumber, start);
+        }
+
+        while is_digit(peek(p)) || peek(p) == '_' {
+            take(p);
+        }
+    }
+
+    [] const char text = p.input[start.offset..p.at.offset];
+
+    if is_float {
+        Result(f64, std::parse::NumError) number = float_value(text);
+        if number.is_err() {
+            return fail(p, ErrorKind::NumberOutOfRange, start);
+        }
+
+        t.kind = Tok::Float;
+        t.number = number.unwrap();
+        return Status::Ok;
+    }
+
+    u64 value = 0;
+    for usize i = 0; i < text.len; i++ {
+        if text[i] == '_' {
+            continue;
+        }
+
+        u64 digit = digit_value(text[i]) as u64;
+        if value > (U64_MAX - digit) / 10 {
+            return fail(p, ErrorKind::NumberOutOfRange, start);
+        }
+
+        value = value * 10 + digit;
+    }
+
+    t.kind = Tok::Int;
+    t.magnitude = value;
+    return Status::Ok;
+}
+
+Tok classify([] const char word) {
+    if text_eq(word, "true") {
+        return Tok::True;
+    }
+    if text_eq(word, "false") {
+        return Tok::False;
+    }
+    if text_eq(word, "null") {
+        return Tok::Null;
+    }
+    if text_eq(word, "const") {
+        return Tok::Const;
+    }
+    if text_eq(word, "as") {
+        return Tok::As;
+    }
+
+    if text_eq(word, "alignof") || text_eq(word, "asm") || text_eq(word, "bool")
+    || text_eq(
+        word,
+        "break"
+    ) || text_eq(
+        word,
+        "char"
+    ) || text_eq(
+        word,
+        "compiles"
+    )
+    || text_eq(
+        word,
+        "continue"
+    ) || text_eq(
+        word,
+        "defer"
+    ) || text_eq(
+        word,
+        "do"
+    )
+    || text_eq(
+        word,
+        "else"
+    ) || text_eq(
+        word,
+        "enum"
+    ) || text_eq(
+        word,
+        "extern"
+    )
+    || text_eq(
+        word,
+        "f32"
+    ) || text_eq(
+        word,
+        "f64"
+    ) || text_eq(
+        word,
+        "for"
+    )
+    || text_eq(
+        word,
+        "i16"
+    ) || text_eq(
+        word,
+        "i32"
+    ) || text_eq(
+        word,
+        "i64"
+    )
+    || text_eq(
+        word,
+        "i8"
+    ) || text_eq(
+        word,
+        "if"
+    ) || text_eq(
+        word,
+        "import"
+    )
+    || text_eq(
+        word,
+        "isize"
+    ) || text_eq(
+        word,
+        "match"
+    ) || text_eq(
+        word,
+        "module"
+    )
+    || text_eq(
+        word,
+        "null_t"
+    ) || text_eq(
+        word,
+        "offsetof"
+    ) || text_eq(
+        word,
+        "public"
+    )
+    || text_eq(
+        word,
+        "restrict"
+    ) || text_eq(
+        word,
+        "return"
+    ) || text_eq(
+        word,
+        "sizeof"
+    )
+    || text_eq(
+        word,
+        "static"
+    ) || text_eq(
+        word,
+        "struct"
+    ) || text_eq(
+        word,
+        "typeof"
+    )
+    || text_eq(
+        word,
+        "u16"
+    ) || text_eq(
+        word,
+        "u32"
+    ) || text_eq(
+        word,
+        "u64"
+    )
+    || text_eq(
+        word,
+        "u8"
+    ) || text_eq(
+        word,
+        "union"
+    ) || text_eq(
+        word,
+        "using"
+    )
+    || text_eq(
+        word,
+        "usize"
+    ) || text_eq(
+        word,
+        "void"
+    ) || text_eq(
+        word,
+        "volatile"
+    )
+    || text_eq(
+        word,
+        "while"
+    ) {
+        return Tok::Keyword;
+    }
+
+    return Tok::Ident;
+}
+
+Result(Tok, ErrorKind) lex_punctuation(Parser* p) {
+    Position start = p.at;
+    char c = take(p);
+    char n = peek(p);
+
+    if c == '{' {
+        return Result::Ok(Tok::LBrace);
+    }
+    if c == '}' {
+        return Result::Ok(Tok::RBrace);
+    }
+    if c == '(' {
+        return Result::Ok(Tok::LParen);
+    }
+    if c == ')' {
+        return Result::Ok(Tok::RParen);
+    }
+    if c == '[' {
+        return Result::Ok(Tok::LBracket);
+    }
+    if c == ']' {
+        return Result::Ok(Tok::RBracket);
+    }
+    if c == ',' {
+        return Result::Ok(Tok::Comma);
+    }
+    if c == ';' {
+        return Result::Ok(Tok::Semicolon);
+    }
+    if c == '~' {
+        return Result::Ok(Tok::Tilde);
+    }
+    if c == '?' || c == '$' || c == '@' || c == '#' {
+        return Result::Ok(Tok::Other);
+    }
+
+    if c == '.' {
+        if n != '.' {
+            return Result::Ok(Tok::Dot);
+        }
+
+        take(p);
+        if peek(p) == '.' {
+            take(p);
+        }
+        return Result::Ok(Tok::Other);
+    }
+
+    if c == ':' {
+        if n == ':' {
+            take(p);
+            return Result::Ok(Tok::ColonColon);
+        }
+        return Result::Ok(Tok::Other);
+    }
+
+    if c == '+' {
+        if n == '+' || n == '=' {
+            take(p);
+            return Result::Ok(Tok::Other);
+        }
+        return Result::Ok(Tok::Plus);
+    }
+
+    if c == '-' {
+        if n == '-' || n == '=' || n == '>' {
+            take(p);
+            return Result::Ok(Tok::Other);
+        }
+        return Result::Ok(Tok::Minus);
+    }
+
+    if c == '*' || c == '/' || c == '%' || c == '^' {
+        if n == '=' {
+            take(p);
+            return Result::Ok(Tok::Other);
+        }
+
+        if c == '*' {
+            return Result::Ok(Tok::Star);
+        }
+        if c == '/' {
+            return Result::Ok(Tok::Slash);
+        }
+        if c == '%' {
+            return Result::Ok(Tok::Percent);
+        }
+        return Result::Ok(Tok::Caret);
+    }
+
+    if c == '&' {
+        if n == '&' {
+            take(p);
+            return Result::Ok(Tok::AmpAmp);
+        }
+        if n == '=' {
+            take(p);
+            return Result::Ok(Tok::Other);
+        }
+        return Result::Ok(Tok::Amp);
+    }
+
+    if c == '|' {
+        if n == '|' {
+            take(p);
+            return Result::Ok(Tok::PipePipe);
+        }
+        if n == '=' {
+            take(p);
+            return Result::Ok(Tok::Other);
+        }
+        return Result::Ok(Tok::Pipe);
+    }
+
+    if c == '!' {
+        if n == '=' {
+            take(p);
+            return Result::Ok(Tok::BangEq);
+        }
+        return Result::Ok(Tok::Bang);
+    }
+
+    if c == '=' {
+        if n == '=' {
+            take(p);
+            return Result::Ok(Tok::EqEq);
+        }
+        if n == '>' {
+            take(p);
+            return Result::Ok(Tok::Other);
+        }
+        return Result::Ok(Tok::Eq);
+    }
+
+    if c == '<' || c == '>' {
+        if n == c {
+            take(p);
+            if peek(p) == '=' {
+                take(p);
+                return Result::Ok(Tok::Other);
+            }
+            return Result::Ok(
+                if c == '<' {
+                    Tok::LtLt
+                } else {
+                    Tok::GtGt
+                }
+            );
+        }
+
+        if n == '=' {
+            take(p);
+            return Result::Ok(
+                if c == '<' {
+                    Tok::LtEq
+                } else {
+                    Tok::GtEq
+                }
+            );
+        }
+
+        return Result::Ok(
+            if c == '<' {
+                Tok::Lt
+            } else {
+                Tok::Gt
+            }
+        );
+    }
+
+    return fail(p, ErrorKind::UnexpectedByte, start);
+}
+
+/// reads the next token into `p.tok`.
+Status(ErrorKind) next_token(Parser* p) {
+    skip_trivia(p) ?;
+
+    Token t = {};
+    t.at = p.at;
+
+    if at_end(p) {
+        t.kind = Tok::End;
+        t.end = p.at.offset;
+        p.tok = t;
+        return Status::Ok;
+    }
+
+    char c = peek(p);
+    char n = byte_at(p, p.at.offset + 1);
+
+    if c == '\\' && n == '\\' && at_line_start(p) {
+        lex_multiline(p);
+        t.kind = Tok::Multiline;
+    } else if c == 'u' && (n == '"' || n == '\'') {
+        return fail(p, ErrorKind::NotAllowed, p.at);
+    } else if is_ident_start(c) {
+        while is_ident_continue(peek(p)) {
+            take(p);
+        }
+        t.kind = classify(p.input[t.at.offset..p.at.offset]);
+    } else if is_digit(c) {
+        lex_number(p, &t) ?;
+    } else if c == '"' {
+        lex_string(p) ?;
+        t.kind = Tok::String;
+    } else if c == '\'' {
+        u32 value = lex_char(p) ?;
+        t.kind = Tok::Char;
+        t.magnitude = value as u64;
+    } else {
+        t.kind = lex_punctuation(p) ?;
+    }
+
+    t.end = p.at.offset;
+    p.tok = t;
+    return Status::Ok;
+}
+
+/// kind of the token after `p.tok`, without consuming anything.
+Result(Tok, ErrorKind) peek_kind(Parser* p) {
+    Position at = p.at;
+    Token tok = p.tok;
+
+    next_token(p) ?;
+    Tok kind = p.tok.kind;
+
+    p.at = at;
+    p.tok = tok;
+    return Result::Ok(kind);
+}
+
+[] const char token_text(const Parser* p) {
+    return p.input[p.tok.at.offset..p.tok.end];
+}
+
+/// the error for a token that cannot appear where it is.
+ErrorKind unexpected(Parser* p) {
+    if p.tok.kind == Tok::End {
+        return fail(p, ErrorKind::UnexpectedEnd, p.tok.at);
+    }
+
+    return fail(p, ErrorKind::UnexpectedToken, p.tok.at);
+}
+
+//!
+//! Storage
+//!
+//! The tree lives in chunks that are released together, so a failed parse
+//! and `deinit` free everything without walking it, and a constant used
+//! twice can share its subtree. The parser's own scratch buffers grow by
+//! doubling and are freed when it returns.
+//!
+
+struct ChunkHeader {
+    u8* prev;
+    usize prev_len;
+}
+
+using usize CHUNK_SIZE = 16384;
+using usize CHUNK_HEADER = 16;
+using usize CHUNK_ALIGN = 16;
+
+Result([] u8, ErrorKind) arena_allocate(A)(
+    A* alloc,
+    Parser* p,
+    usize size,
+    usize align
+) if AllocatorPolicy(
+    A
+) {
+    if size == 0 {
+        [] u8 empty = {};
+        return Result::Ok(empty);
+    }
+
+    usize start = (p.used + align - 1) / align * align;
+
+    if p.chunk.len == 0 || start > p.chunk.len || size > p.chunk.len - start {
+        usize want = CHUNK_SIZE;
+        if size > CHUNK_SIZE - CHUNK_HEADER {
+            if size > USIZE_MAX - CHUNK_HEADER {
+                return fail(p, ErrorKind::OutOfMemory, p.tok.at);
+            }
+            want = size + CHUNK_HEADER;
+        }
+
+        Result([] u8, std::alloc::AllocError) block = alloc.allocate(
+            want,
+            CHUNK_ALIGN
+        );
+        if block.is_err() {
+            return fail(p, ErrorKind::OutOfMemory, p.tok.at);
+        }
+
+        [] u8 fresh = block.unwrap();
+        ChunkHeader* header = fresh.ptr as ChunkHeader*;
+        header.prev = p.chunk.ptr;
+        header.prev_len = p.chunk.len;
+
+        p.chunk = fresh;
+        start = CHUNK_HEADER;
+    }
+
+    p.used = start + size;
+    return Result::Ok(p.chunk[start..start + size]);
+}
+
+void arena_free(A)(A* alloc, [] u8 newest) if AllocatorPolicy(A) {
+    [] u8 current = newest;
+
+    while current.len != 0 {
+        ChunkHeader* header = current.ptr as ChunkHeader*;
+        [] u8 prev = core::slice::from_raw(header.prev, header.prev_len);
+        alloc.free(current, CHUNK_ALIGN);
+        current = prev;
+    }
+}
+
+Result([] const char, ErrorKind) arena_text(A)(
+    A* alloc,
+    Parser* p,
+    [] const char source
+) if AllocatorPolicy(
+    A
+) {
+    [] u8 raw = arena_allocate(alloc, p, source.len, 1) ?;
+    [] char copy = raw as [] char;
+
+    for usize i = 0; i < source.len; i++ {
+        copy[i] = source[i];
+    }
+
+    return Result::Ok(copy as [] const char);
+}
+
+Result([] Node, ErrorKind) arena_nodes(A)(A* alloc, Parser* p, usize count) if AllocatorPolicy(
+    A
+) {
+    if count > USIZE_MAX / sizeof (Node) {
+        return fail(p, ErrorKind::OutOfMemory, p.tok.at);
+    }
+
+    [] u8 raw = arena_allocate(alloc, p, count * sizeof (Node), alignof (Node)) ?;
+    return Result::Ok(std::alloc::as_typed!Node(raw, count));
+}
+
+Result([] Field, ErrorKind) arena_fields(A)(A* alloc, Parser* p, usize count) if AllocatorPolicy(
+    A
+) {
+    if count > USIZE_MAX / sizeof (Field) {
+        return fail(p, ErrorKind::OutOfMemory, p.tok.at);
+    }
+
+    [] u8 raw = arena_allocate(
+        alloc,
+        p,
+        count * sizeof (Field),
+        alignof (Field)
+    ) ?;
+    return Result::Ok(std::alloc::as_typed!Field(raw, count));
+}
+
+/// capacity after growing `have` to hold `need`. None on overflow.
+Optional(usize) grown_capacity(usize have, usize need, usize least) {
+    usize want = if have == 0 {
+        least
+    } else {
+        have
+    };
+
+    while want < need {
+        if want > USIZE_MAX / 2 {
+            return Optional::None;
+        }
+        want = want * 2;
+    }
+
+    return Optional::Some(want);
+}
+
+/// makes room for `extra` more bytes in `p.text`.
+Status(ErrorKind) reserve_text(A)(A* alloc, Parser* p, usize extra) if AllocatorPolicy(
+    A
+) {
+    if extra <= p.text.len - p.text_len {
+        return Status::Ok;
+    }
+
+    if extra > USIZE_MAX - p.text_len {
+        return fail(p, ErrorKind::OutOfMemory, p.tok.at);
+    }
+
+    Optional(usize) want = grown_capacity(p.text.len, p.text_len + extra, 256);
+    if want.is_none() {
+        return fail(p, ErrorKind::OutOfMemory, p.tok.at);
+    }
+
+    Result([] char, std::alloc::AllocError) grown = alloc.allocate_slice(
+        want.unwrap_some()
+    );
+    if grown.is_err() {
+        return fail(p, ErrorKind::OutOfMemory, p.tok.at);
+    }
+
+    [] char fresh = grown.unwrap();
+    for usize i = 0; i < p.text_len; i++ {
+        fresh[i] = p.text[i];
+    }
+
+    if p.text.len != 0 {
+        alloc.free_slice(p.text);
+    }
+
+    p.text = fresh;
+    return Status::Ok;
+}
+
+Status(ErrorKind) push_field(A)(A* alloc, Parser* p, Field field) if AllocatorPolicy(
+    A
+) {
+    if p.stack_len == p.stack.len {
+        Optional(usize) want = grown_capacity(p.stack.len, p.stack_len + 1, 32);
+        if want.is_none() {
+            return fail(p, ErrorKind::OutOfMemory, p.tok.at);
+        }
+
+        Result([] Field, std::alloc::AllocError) grown = alloc.allocate_slice(
+            want.unwrap_some()
+        );
+        if grown.is_err() {
+            return fail(p, ErrorKind::OutOfMemory, p.tok.at);
+        }
+
+        [] Field fresh = grown.unwrap();
+        for usize i = 0; i < p.stack_len; i++ {
+            fresh[i] = p.stack[i];
+        }
+
+        if p.stack.len != 0 {
+            alloc.free_slice(p.stack);
+        }
+
+        p.stack = fresh;
+    }
+
+    p.stack[p.stack_len] = field;
+    p.stack_len = p.stack_len + 1;
+    return Status::Ok;
+}
+
+Status(ErrorKind) push_constant(A)(A* alloc, Parser* p, Constant constant) if AllocatorPolicy(
+    A
+) {
+    if p.const_count == p.consts.len {
+        Optional(usize) want = grown_capacity(
+            p.consts.len,
+            p.const_count + 1,
+            8
+        );
+        if want.is_none() {
+            return fail(p, ErrorKind::OutOfMemory, p.tok.at);
+        }
+
+        Result([] Constant, std::alloc::AllocError) grown = alloc.allocate_slice(
+            want.unwrap_some()
+        );
+        if grown.is_err() {
+            return fail(p, ErrorKind::OutOfMemory, p.tok.at);
+        }
+
+        [] Constant fresh = grown.unwrap();
+        for usize i = 0; i < p.const_count; i++ {
+            fresh[i] = p.consts[i];
+        }
+
+        if p.consts.len != 0 {
+            alloc.free_slice(p.consts);
+        }
+
+        p.consts = fresh;
+    }
+
+    p.consts[p.const_count] = constant;
+    p.const_count = p.const_count + 1;
+    return Status::Ok;
+}
+
+void release_scratch(A)(A* alloc, Parser* p) if AllocatorPolicy(A) {
+    if p.text.len != 0 {
+        alloc.free_slice(p.text);
+    }
+    if p.stack.len != 0 {
+        alloc.free_slice(p.stack);
+    }
+    if p.consts.len != 0 {
+        alloc.free_slice(p.consts);
+    }
+}
+
+//!
+//! Constant folding
+//!
+//! The operators dpm accepts in a manifest, over the values a document can
+//! hold. Without a schema there is no field type to adopt, so integers are
+//! i64 throughout and leaving that range is an error instead of a wrap.
+//!
+
+Node make_node(Kind kind, Position at) {
+    Node n = {};
+    n.kind = kind;
+    n.at = at;
+    return n;
+}
+
+Node make_integer(i64 value, Position at) {
+    Node n = make_node(Kind::Integer, at);
+    n.integer = value;
+    return n;
+}
+
+Node make_float(f64 value, Position at) {
+    Node n = make_node(Kind::Float, at);
+    n.number = value;
+    return n;
+}
+
+Node make_bool(bool value, Position at) {
+    Node n = make_node(Kind::Bool, at);
+    n.boolean = value;
+    return n;
+}
+
+bool mul_overflows(i64 a, i64 b) {
+    if a == 0 || b == 0 {
+        return false;
+    }
+
+    if a > 0 {
+        if b > 0 {
+            return a > I64_MAX / b;
+        }
+        return b < std::parse::I64_MIN / a;
+    }
+
+    if b > 0 {
+        return a < std::parse::I64_MIN / b;
+    }
+
+    return b < I64_MAX / a;
+}
+
+Result(Node, ErrorKind) fold_integers(
+    Parser* p,
+    Token op,
+    i64 a,
+    i64 b,
+    Position at
+) {
+    Tok k = op.kind;
+
+    if k == Tok::EqEq {
+        return Result::Ok(make_bool(a == b, at));
+    }
+    if k == Tok::BangEq {
+        return Result::Ok(make_bool(a != b, at));
+    }
+    if k == Tok::Lt {
+        return Result::Ok(make_bool(a < b, at));
+    }
+    if k == Tok::Gt {
+        return Result::Ok(make_bool(a > b, at));
+    }
+    if k == Tok::LtEq {
+        return Result::Ok(make_bool(a <= b, at));
+    }
+    if k == Tok::GtEq {
+        return Result::Ok(make_bool(a >= b, at));
+    }
+    if k == Tok::Amp {
+        return Result::Ok(make_integer(a & b, at));
+    }
+    if k == Tok::Pipe {
+        return Result::Ok(make_integer(a | b, at));
+    }
+    if k == Tok::Caret {
+        return Result::Ok(make_integer(a ^ b, at));
+    }
+
+    if k == Tok::Plus {
+        if (b > 0 && a > I64_MAX - b) || (b < 0 && a < std::parse::I64_MIN - b) {
+            return fail(p, ErrorKind::Overflow, op.at);
+        }
+        return Result::Ok(make_integer(a + b, at));
+    }
+
+    if k == Tok::Minus {
+        if (b < 0 && a > I64_MAX + b) || (b > 0 && a < std::parse::I64_MIN + b) {
+            return fail(p, ErrorKind::Overflow, op.at);
+        }
+        return Result::Ok(make_integer(a - b, at));
+    }
+
+    if k == Tok::Star {
+        if mul_overflows(a, b) {
+            return fail(p, ErrorKind::Overflow, op.at);
+        }
+        return Result::Ok(make_integer(a * b, at));
+    }
+
+    if k == Tok::Slash || k == Tok::Percent {
+        if b == 0 {
+            return fail(p, ErrorKind::DivisionByZero, op.at);
+        }
+        if a == std::parse::I64_MIN && b == -1 {
+            return fail(p, ErrorKind::Overflow, op.at);
+        }
+        return Result::Ok(
+            make_integer(
+                if k == Tok::Slash {
+                    a / b
+                } else {
+                    a % b
+                },
+                at
+            )
+        );
+    }
+
+    if k == Tok::LtLt || k == Tok::GtGt {
+        if b < 0 || b > 63 {
+            return fail(p, ErrorKind::Overflow, op.at);
+        }
+        if k == Tok::LtLt {
+            return Result::Ok(
+                make_integer(((a as u64) << (b as u64)) as i64, at)
+            );
+        }
+        return Result::Ok(make_integer(a >> b, at));
+    }
+
+    return fail(p, ErrorKind::TypeMismatch, op.at);
+}
+
+Result(Node, ErrorKind) fold_floats(
+    Parser* p,
+    Token op,
+    f64 a,
+    f64 b,
+    Position at
+) {
+    Tok k = op.kind;
+
+    if k == Tok::EqEq {
+        return Result::Ok(make_bool(a == b, at));
+    }
+    if k == Tok::BangEq {
+        return Result::Ok(make_bool(a != b, at));
+    }
+    if k == Tok::Lt {
+        return Result::Ok(make_bool(a < b, at));
+    }
+    if k == Tok::Gt {
+        return Result::Ok(make_bool(a > b, at));
+    }
+    if k == Tok::LtEq {
+        return Result::Ok(make_bool(a <= b, at));
+    }
+    if k == Tok::GtEq {
+        return Result::Ok(make_bool(a >= b, at));
+    }
+
+    f64 value = 0.0;
+    if k == Tok::Plus {
+        value = a + b;
+    } else if k == Tok::Minus {
+        value = a - b;
+    } else if k == Tok::Star {
+        value = a * b;
+    } else if k == Tok::Slash {
+        if b == 0.0 {
+            return fail(p, ErrorKind::DivisionByZero, op.at);
+        }
+        value = a / b;
+    } else {
+        return fail(p, ErrorKind::TypeMismatch, op.at);
+    }
+
+    // a document holds finite floats only
+    if value > F64_MAX || value < -F64_MAX {
+        return fail(p, ErrorKind::Overflow, op.at);
+    }
+
+    return Result::Ok(make_float(value, at));
+}
+
+Result(Node, ErrorKind) fold_binary(
+    Parser* p,
+    Token op,
+    const Node* left,
+    const Node* right
+) {
+    if left.kind != right.kind {
+        return fail(p, ErrorKind::TypeMismatch, op.at);
+    }
+
+    if left.kind == Kind::Integer {
+        return fold_integers(p, op, left.integer, right.integer, left.at);
+    }
+
+    if left.kind == Kind::Float {
+        return fold_floats(p, op, left.number, right.number, left.at);
+    }
+
+    if left.kind == Kind::Char {
+        // characters compare; they take no arithmetic
+        if precedence(op.kind) == 8 || precedence(op.kind) == 9 {
+            return fold_integers(p, op, left.integer, right.integer, left.at);
+        }
+        return fail(p, ErrorKind::TypeMismatch, op.at);
+    }
+
+    if left.kind == Kind::Bool {
+        bool a = left.boolean;
+        bool b = right.boolean;
+
+        if op.kind == Tok::AmpAmp {
+            return Result::Ok(make_bool(a && b, left.at));
+        }
+        if op.kind == Tok::PipePipe {
+            return Result::Ok(make_bool(a || b, left.at));
+        }
+        if op.kind == Tok::EqEq {
+            return Result::Ok(make_bool(a == b, left.at));
+        }
+        if op.kind == Tok::BangEq {
+            return Result::Ok(make_bool(a != b, left.at));
+        }
+    }
+
+    return fail(p, ErrorKind::TypeMismatch, op.at);
+}
+
+/// binding strength of a binary operator, as in the compiler. -1 for a
+/// token that is not one.
+i32 precedence(Tok k) {
+    if k == Tok::PipePipe {
+        return 3;
+    }
+    if k == Tok::AmpAmp {
+        return 4;
+    }
+    if k == Tok::Pipe {
+        return 5;
+    }
+    if k == Tok::Caret {
+        return 6;
+    }
+    if k == Tok::Amp {
+        return 7;
+    }
+    if k == Tok::EqEq || k == Tok::BangEq {
+        return 8;
+    }
+    if k == Tok::Lt || k == Tok::Gt || k == Tok::LtEq || k == Tok::GtEq {
+        return 9;
+    }
+    if k == Tok::LtLt || k == Tok::GtGt {
+        return 11;
+    }
+    if k == Tok::Plus || k == Tok::Minus {
+        return 12;
+    }
+    if k == Tok::Star || k == Tok::Slash || k == Tok::Percent {
+        return 13;
+    }
+    return -1;
+}
+
+//!
+//! Parser
+//!
+
+/// appends the contents of a quoted string token to `p.text`, which has
+/// room for it. the lexer already validated the escapes.
+void decode_quoted(Parser* p, [] const char raw) {
+    usize i = 1;
+    usize end = raw.len - 1;
+
+    while i < end {
+        char c = raw[i];
+        if c != '\\' {
+            p.text[p.text_len] = c;
+            p.text_len = p.text_len + 1;
+            i++;
+            continue;
+        }
+
+        i++;
+        Optional(Escape) scanned = scan_escape(raw, &i);
+        if scanned.is_none() {
+            return;
+        }
+
+        Escape e = scanned.unwrap_some();
+        if e.byte {
+            p.text[p.text_len] = e.value as u8 as char;
+            p.text_len = p.text_len + 1;
+        } else {
+            Result(usize, std::utf8::Utf8Error) wrote = std::utf8::encode(
+                e.value,
+                p.text[p.text_len..p.text.len]
+            );
+            if wrote.is_ok() {
+                p.text_len = p.text_len + wrote.unwrap();
+            }
+        }
+    }
+}
+
+/// appends the lines of a multiline string token to `p.text`, joined by
+/// line feeds.
+void decode_multiline(Parser* p, [] const char raw) {
+    usize i = 0;
+    bool first = true;
+
+    while i < raw.len {
+        while i < raw.len && raw[i] != '\\' {
+            i++;
+        }
+        i = i + 2;
+
+        if !first {
+            p.text[p.text_len] = '\n';
+            p.text_len = p.text_len + 1;
+        }
+        first = false;
+
+        while i < raw.len && raw[i] != '\r' && raw[i] != '\n' {
+            p.text[p.text_len] = raw[i];
+            p.text_len = p.text_len + 1;
+            i++;
+        }
+    }
+}
+
+/// adjacent string literals form one string.
+Result(Node, ErrorKind) parse_string(A)(A* alloc, Parser* p) if AllocatorPolicy(
+    A
+) {
+    Node node = make_node(Kind::String, p.tok.at);
+    p.text_len = 0;
+
+    while p.tok.kind == Tok::String || p.tok.kind == Tok::Multiline {
+        [] const char raw = token_text(p);
+        reserve_text(alloc, p, raw.len) ?;
+
+        if p.tok.kind == Tok::String {
+            decode_quoted(p, raw);
+        } else {
+            decode_multiline(p, raw);
+        }
+
+        next_token(p) ?;
+    }
+
+    node.text = arena_text(alloc, p, p.text[0..p.text_len]) ?;
+    return Result::Ok(node);
+}
+
+Optional(usize) find_constant(const Parser* p, [] const char name) {
+    for usize i = 0; i < p.const_count; i++ {
+        if text_eq(p.consts[i].name, name) {
+            return Optional::Some(i);
+        }
+    }
+
+    return Optional::None;
+}
+
+/// true for `a`, `a::b`, ...: a type this module can keep as a struct name.
+bool is_path([] const char text) {
+    if text.len == 0 || !is_ident_start(text[0]) {
+        return false;
+    }
+
+    for usize i = 0; i < text.len; i++ {
+        if !is_ident_continue(text[i]) && text[i] != ':' {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/// value of constant `index`, evaluating it on first use so that constants
+/// may refer to ones declared after them.
+Result(Node, ErrorKind) constant_value(A)(
+    A* alloc,
+    Parser* p,
+    usize index,
+    Position use
+) if AllocatorPolicy(
+    A
+) {
+    if p.consts[index].state == 2 {
+        return Result::Ok(p.consts[index].value);
+    }
+
+    if p.consts[index].state == 1 {
+        return fail(p, ErrorKind::CyclicConstant, use);
+    }
+
+    p.consts[index].state = 1;
+
+    Position at = p.at;
+    Token tok = p.tok;
+
+    p.at = p.consts[index].start;
+    next_token(p) ?;
+    Node value = parse_expr(alloc, p, 0) ?;
+    if p.tok.kind != Tok::Semicolon {
+        return unexpected(p);
+    }
+
+    p.at = at;
+    p.tok = tok;
+
+    if value.kind == Kind::Struct && value.text.len == 0 && is_path(
+        p.consts[index].type_name
+    ) {
+        value.text = arena_text(alloc, p, p.consts[index].type_name) ?;
+    }
+
+    p.consts[index].value = value;
+    p.consts[index].state = 2;
+    return Result::Ok(value);
+}
+
+/// `{ ... }` with the cursor on the brace. `type_name` is the path written
+/// before it, already owned by the arena, or empty.
+Result(Node, ErrorKind) parse_braces(A)(
+    A* alloc,
+    Parser* p,
+    [] const char type_name,
+    Position at
+) if AllocatorPolicy(
+    A
+) {
+    next_token(p) ?;
+
+    usize base = p.stack_len;
+    bool named = type_name.len != 0;
+
+    while p.tok.kind != Tok::RBrace {
+        Field field = {};
+        field.at = p.tok.at;
+
+        if p.tok.kind == Tok::Ident {
+            Tok after = peek_kind(p) ?;
+
+            if after == Tok::Eq {
+                [] const char name = token_text(p);
+                for usize i = base; i < p.stack_len; i++ {
+                    if text_eq(p.stack[i].name, name) {
+                        return fail(p, ErrorKind::DuplicateField, p.tok.at);
+                    }
+                }
+
+                field.name = arena_text(alloc, p, name) ?;
+                named = true;
+                next_token(p) ?;
+                next_token(p) ?;
+            } else if after == Tok::Comma || after == Tok::RBrace {
+                // `{ name }` initializes the field `name` from the constant
+                // `name` when the literal is a struct
+                field.name = arena_text(alloc, p, token_text(p)) ?;
+            }
+        }
+
+        field.value = parse_expr(alloc, p, 0) ?;
+        push_field(alloc, p, field) ?;
+
+        if p.tok.kind == Tok::Comma {
+            next_token(p) ?;
+            continue;
+        }
+
+        if p.tok.kind != Tok::RBrace {
+            return unexpected(p);
+        }
+    }
+
+    next_token(p) ?;
+
+    usize count = p.stack_len - base;
+    Node node = make_node(
+        if named {
+            Kind::Struct
+        } else {
+            Kind::List
+        },
+        at
+    );
+    node.text = type_name;
+
+    if named {
+        [] Field fields = arena_fields(alloc, p, count) ?;
+        for usize i = 0; i < count; i++ {
+            fields[i] = p.stack[base + i];
+        }
+        node.fields = fields;
+    } else {
+        [] Node items = arena_nodes(alloc, p, count) ?;
+        for usize i = 0; i < count; i++ {
+            items[i] = p.stack[base + i].value;
+        }
+        node.items = items;
+    }
+
+    p.stack_len = base;
+    return Result::Ok(node);
+}
+
+/// a name, a path, or a typed struct literal.
+Result(Node, ErrorKind) parse_path(A)(A* alloc, Parser* p) if AllocatorPolicy(A) {
+    Position at = p.tok.at;
+    [] const char first = token_text(p);
+    usize segments = 0;
+    p.text_len = 0;
+
+    while true {
+        if p.tok.kind != Tok::Ident {
+            return unexpected(p);
+        }
+
+        [] const char segment = token_text(p);
+        reserve_text(alloc, p, segment.len + 2) ?;
+        if segments != 0 {
+            p.text[p.text_len] = ':';
+            p.text[p.text_len + 1] = ':';
+            p.text_len = p.text_len + 2;
+        }
+        for usize i = 0; i < segment.len; i++ {
+            p.text[p.text_len + i] = segment[i];
+        }
+        p.text_len = p.text_len + segment.len;
+        segments++;
+
+        next_token(p) ?;
+        if p.tok.kind != Tok::ColonColon {
+            break;
+        }
+        next_token(p) ?;
+    }
+
+    if p.tok.kind == Tok::LBrace {
+        [] const char type_name = arena_text(alloc, p, p.text[0..p.text_len]) ?;
+        return parse_braces(alloc, p, type_name, at);
+    }
+
+    if segments == 1 {
+        Optional(usize) index = find_constant(p, first);
+        if index.is_none() {
+            return fail(p, ErrorKind::UnknownName, at);
+        }
+
+        Node value = constant_value(alloc, p, index.unwrap_some(), at) ?;
+        value.at = at;
+        return Result::Ok(value);
+    }
+
+    Node node = make_node(Kind::Enum, at);
+    node.text = arena_text(alloc, p, p.text[0..p.text_len]) ?;
+    return Result::Ok(node);
+}
+
+Result(Node, ErrorKind) parse_primary(A)(A* alloc, Parser* p) if AllocatorPolicy(
+    A
+) {
+    Token t = p.tok;
+    Tok k = t.kind;
+
+    if k == Tok::Int {
+        Result(i64, std::parse::NumError) value = std::parse::signed_from_magnitude(
+            t.magnitude,
+            false
+        );
+        if value.is_err() {
+            return fail(p, ErrorKind::NumberOutOfRange, t.at);
+        }
+
+        next_token(p) ?;
+        return Result::Ok(make_integer(value.unwrap(), t.at));
+    }
+
+    if k == Tok::Float {
+        next_token(p) ?;
+        return Result::Ok(make_float(t.number, t.at));
+    }
+
+    if k == Tok::Char {
+        next_token(p) ?;
+        Node node = make_node(Kind::Char, t.at);
+        node.integer = t.magnitude as i64;
+        return Result::Ok(node);
+    }
+
+    if k == Tok::String || k == Tok::Multiline {
+        return parse_string(alloc, p);
+    }
+
+    if k == Tok::True || k == Tok::False {
+        next_token(p) ?;
+        return Result::Ok(make_bool(k == Tok::True, t.at));
+    }
+
+    if k == Tok::LParen {
+        next_token(p) ?;
+        Node inner = parse_expr(alloc, p, 0) ?;
+        if p.tok.kind != Tok::RParen {
+            return unexpected(p);
+        }
+
+        next_token(p) ?;
+        return Result::Ok(inner);
+    }
+
+    if k == Tok::LBrace {
+        return parse_braces(alloc, p, "", t.at);
+    }
+
+    if k == Tok::Ident {
+        return parse_path(alloc, p);
+    }
+
+    if k == Tok::Null {
+        return fail(p, ErrorKind::NotAllowed, t.at);
+    }
+
+    if k == Tok::Keyword {
+        [] const char word = token_text(p);
+        if text_eq(word, "if") || text_eq(word, "match") || text_eq(
+            word,
+            "sizeof"
+        )
+        || text_eq(
+            word,
+            "alignof"
+        ) || text_eq(
+            word,
+            "offsetof"
+        )
+        || text_eq(
+            word,
+            "compiles"
+        ) || text_eq(
+            word,
+            "asm"
+        ) {
+            return fail(p, ErrorKind::NotAllowed, t.at);
+        }
+    }
+
+    // a lambda begins with `|` or `||`
+    if k == Tok::Pipe || k == Tok::PipePipe {
+        return fail(p, ErrorKind::NotAllowed, t.at);
+    }
+
+    return unexpected(p);
+}
+
+Result(Node, ErrorKind) parse_postfix(A)(A* alloc, Parser* p) if AllocatorPolicy(
+    A
+) {
+    Node node = parse_primary(alloc, p) ?;
+
+    while true {
+        if p.tok.kind == Tok::LParen || p.tok.kind == Tok::LBracket {
+            return fail(p, ErrorKind::NotAllowed, p.tok.at);
+        }
+
+        if p.tok.kind != Tok::Dot {
+            return Result::Ok(node);
+        }
+
+        next_token(p) ?;
+        if p.tok.kind == Tok::Int {
+            return fail(p, ErrorKind::NotAllowed, p.tok.at);
+        }
+        if p.tok.kind != Tok::Ident {
+            return unexpected(p);
+        }
+        if node.kind != Kind::Struct {
+            return fail(p, ErrorKind::TypeMismatch, p.tok.at);
+        }
+
+        [] const char name = token_text(p);
+        bool found = false;
+        for usize i = 0; i < node.fields.len; i++ {
+            if text_eq(node.fields[i].name, name) {
+                Position at = node.at;
+                node = node.fields[i].value;
+                node.at = at;
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            return fail(p, ErrorKind::UnknownField, p.tok.at);
+        }
+
+        next_token(p) ?;
+    }
+}
+
+Result(Node, ErrorKind) parse_unary(A)(A* alloc, Parser* p) if AllocatorPolicy(
+    A
+) {
+    Token op = p.tok;
+    Tok k = op.kind;
+
+    if k != Tok::Minus && k != Tok::Bang && k != Tok::Tilde {
+        if k == Tok::Amp || k == Tok::Star {
+            return fail(p, ErrorKind::NotAllowed, op.at);
+        }
+
+        return parse_postfix(alloc, p);
+    }
+
+    next_token(p) ?;
+
+    // the one literal whose magnitude does not fit before it is negated
+    if k == Tok::Minus
+        && p.tok.kind == Tok::Int
+        && p.tok.magnitude == std::parse::I64_MIN_MAGNITUDE
+    {
+        next_token(p) ?;
+        return Result::Ok(make_integer(std::parse::I64_MIN, op.at));
+    }
+
+    if p.depth >= MAX_DEPTH {
+        return fail(p, ErrorKind::DepthExceeded, op.at);
+    }
+
+    p.depth = p.depth + 1;
+    Node operand = parse_unary(alloc, p) ?;
+    p.depth = p.depth - 1;
+
+    if k == Tok::Minus && operand.kind == Kind::Integer {
+        if operand.integer == std::parse::I64_MIN {
+            return fail(p, ErrorKind::Overflow, op.at);
+        }
+        return Result::Ok(make_integer(0 - operand.integer, op.at));
+    }
+
+    if k == Tok::Minus && operand.kind == Kind::Float {
+        return Result::Ok(make_float(-operand.number, op.at));
+    }
+
+    if k == Tok::Bang && operand.kind == Kind::Bool {
+        return Result::Ok(make_bool(!operand.boolean, op.at));
+    }
+
+    if k == Tok::Tilde && operand.kind == Kind::Integer {
+        return Result::Ok(make_integer(~operand.integer, op.at));
+    }
+
+    return fail(p, ErrorKind::TypeMismatch, op.at);
+}
+
+Result(Node, ErrorKind) parse_expr(A)(A* alloc, Parser* p, i32 min_precedence) if AllocatorPolicy(
+    A
+) {
+    if p.depth >= MAX_DEPTH {
+        return fail(p, ErrorKind::DepthExceeded, p.tok.at);
+    }
+
+    p.depth = p.depth + 1;
+    Node left = parse_unary(alloc, p) ?;
+
+    while true {
+        if p.tok.kind == Tok::As {
+            return fail(p, ErrorKind::NotAllowed, p.tok.at);
+        }
+
+        Token op = p.tok;
+        i32 strength = precedence(op.kind);
+        if strength < 0 || strength < min_precedence {
+            break;
+        }
+
+        next_token(p) ?;
+        Node right = parse_expr(alloc, p, strength + 1) ?;
+        left = fold_binary(p, op, &left, &right) ?;
+    }
+
+    p.depth = p.depth - 1;
+    return Result::Ok(left);
+}
+
+/// `const TYPE NAME = VALUE;` with the cursor on `const`. records where the
+/// value starts and skips it.
+Status(ErrorKind) declare_constant(A)(A* alloc, Parser* p) if AllocatorPolicy(A) {
+    Position declared = p.tok.at;
+    next_token(p) ?;
+
+    usize type_begin = p.tok.at.offset;
+    usize depth = 0;
+    bool have_name = false;
+    Token name = p.tok;
+
+    while true {
+        Tok k = p.tok.kind;
+
+        if k == Tok::End {
+            return unexpected(p);
+        }
+        if depth == 0 && k == Tok::Semicolon {
+            return fail(p, ErrorKind::InvalidDeclaration, declared);
+        }
+        if depth == 0 && k == Tok::Eq {
+            break;
+        }
+
+        if k == Tok::LBrace || k == Tok::LParen || k == Tok::LBracket {
+            depth = depth + 1;
+        } else if k == Tok::RBrace || k == Tok::RParen || k == Tok::RBracket {
+            if depth == 0 {
+                return unexpected(p);
+            }
+            depth = depth - 1;
+        }
+
+        have_name = k == Tok::Ident;
+        name = p.tok;
+        next_token(p) ?;
+    }
+
+    if !have_name || name.at.offset == type_begin {
+        return fail(p, ErrorKind::InvalidDeclaration, declared);
+    }
+
+    usize type_end = name.at.offset;
+    while type_end > type_begin {
+        char c = p.input[type_end - 1];
+        if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
+            break;
+        }
+        type_end = type_end - 1;
+    }
+
+    Constant constant = {};
+    constant.name = p.input[name.at.offset..name.end];
+    constant.type_name = p.input[type_begin..type_end];
+
+    if find_constant(p, constant.name).is_some() {
+        return fail(p, ErrorKind::DuplicateConstant, name.at);
+    }
+
+    next_token(p) ?;
+    constant.start = p.tok.at;
+
+    depth = 0;
+    while true {
+        Tok k = p.tok.kind;
+
+        if k == Tok::End {
+            return unexpected(p);
+        }
+        if depth == 0 && k == Tok::Semicolon {
+            break;
+        }
+
+        if k == Tok::LBrace || k == Tok::LParen || k == Tok::LBracket {
+            depth = depth + 1;
+        } else if k == Tok::RBrace || k == Tok::RParen || k == Tok::RBracket {
+            if depth == 0 {
+                return unexpected(p);
+            }
+            depth = depth - 1;
+        }
+
+        next_token(p) ?;
+    }
+
+    next_token(p) ?;
+    return push_constant(alloc, p, constant);
+}
+
+Position position_of([] const char input, usize offset) {
+    Position at = std::parse::start_position();
+
+    for usize i = 0; i < offset; i++ {
+        std::parse::advance(&at, input[i]);
+    }
+
+    return at;
+}
+
+Result(Node, ErrorKind) parse_document(A)(A* alloc, Parser* p) if AllocatorPolicy(
+    A
+) {
+    for usize i = 0; i < p.input.len; i++ {
+        if p.input[i] == '\0' {
+            return fail(p, ErrorKind::NulByte, position_of(p.input, i));
+        }
+    }
+
+    Optional(usize) malformed = std::utf8::validate(p.input);
+    if malformed.is_some() {
+        return fail(
+            p,
+            ErrorKind::InvalidUtf8,
+            position_of(p.input, malformed.unwrap_some())
+        );
+    }
+
+    next_token(p) ?;
+    while p.tok.kind == Tok::Const {
+        declare_constant(alloc, p) ?;
+    }
+
+    // every constant is checked, used or not
+    for usize i = 0; i < p.const_count; i++ {
+        constant_value(alloc, p, i, p.consts[i].start) ?;
+    }
+
+    if p.tok.kind == Tok::End {
+        return fail(p, ErrorKind::ExpectedStructLiteral, p.tok.at);
+    }
+
+    Position at = p.tok.at;
+    Node root = {};
+
+    if p.tok.kind == Tok::LBrace {
+        root = parse_braces(alloc, p, "", at) ?;
+    } else if p.tok.kind == Tok::Ident {
+        root = parse_path(alloc, p) ?;
+        if root.kind != Kind::Struct || root.text.len == 0 {
+            return fail(p, ErrorKind::ExpectedStructLiteral, at);
+        }
+    } else {
+        return fail(p, ErrorKind::ExpectedStructLiteral, at);
+    }
+
+    if p.tok.kind == Tok::Semicolon {
+        return fail(p, ErrorKind::InvalidDeclaration, at);
+    }
+    if p.tok.kind != Tok::End {
+        return fail(p, ErrorKind::TrailingTokens, p.tok.at);
+    }
+
+    return Result::Ok(root);
+}
+
+//!
+//! Documents
+//!
+
+/// parses one file. the document copies everything it keeps, stores
+/// `alloc` by value and is released by `deinit`. nothing stays allocated
+/// when parsing fails.
+public Result(Document(A), ParseError) parse(A)(
+    A alloc,
+    [] const char input
+) if AllocatorPolicy(
+    A
+) {
+    Parser p = {};
+    p.input = input;
+    p.at = std::parse::start_position();
+    p.error_at = std::parse::start_position();
+
+    Result(Node, ErrorKind) root = parse_document(&alloc, &p);
+    release_scratch(&alloc, &p);
+
+    if root.is_err() {
+        arena_free(&alloc, p.chunk);
+        ParseError error = {kind = root.unwrap_err(), at = p.error_at};
+        return Result::Err(error);
+    }
+
+    Document(A) document = {alloc = alloc, root = root.unwrap(), chunks = p.chunk};
+    return Result::Ok(document);
+}
+
+/// parses with the selected default allocator.
+public Result(Document(A), ParseError) parse(A = DefaultAllocator)(
+    [] const char input
+) if AllocatorPolicy(
+    A
+) {
+    A alloc = {};
+    return parse(alloc, input);
+}
+
+/// releases the tree and empties the document. safe to call twice. every
+/// `Node` and string obtained from the document dies with it.
+public void deinit(A)(Document(A)* self) if AllocatorPolicy(A) {
+    arena_free(&self.alloc, self.chunks);
+    self.chunks = {};
+    self.root = {};
+}
+
+//!
+//! Access
+//!
+//! Lookup is linear and returns the first match; files in this notation
+//! have tens of fields. Every accessor answers None for a node of another
+//! kind, so a chain of lookups needs no kind checks of its own.
+//!
+
+/// the field `name` of a struct.
+public Optional(const Node*) get(const Node* self, [] const char name) {
+    if self.kind != Kind::Struct {
+        return Optional::None;
+    }
+
+    for usize i = 0; i < self.fields.len; i++ {
+        if text_eq(self.fields[i].name, name) {
+            const Node* found = &self.fields[i].value;
+            return Optional::Some(found);
+        }
+    }
+
+    return Optional::None;
+}
+
+/// element `index` of a list, or the value of entry `index` of a struct.
+public Optional(const Node*) item(const Node* self, usize index) {
+    if self.kind == Kind::List && index < self.items.len {
+        const Node* found = &self.items[index];
+        return Optional::Some(found);
+    }
+
+    if self.kind == Kind::Struct && index < self.fields.len {
+        const Node* found = &self.fields[index].value;
+        return Optional::Some(found);
+    }
+
+    return Optional::None;
+}
+
+/// number of elements of a list or entries of a struct; 0 for a scalar.
+public usize len(const Node* self) {
+    if self.kind == Kind::List {
+        return self.items.len;
+    }
+
+    if self.kind == Kind::Struct {
+        return self.fields.len;
+    }
+
+    return 0;
+}
+
+public Optional([] const char) as_string(const Node* self) {
+    if self.kind != Kind::String {
+        return Optional::None;
+    }
+
+    return Optional::Some(self.text);
+}
+
+public Optional(i64) as_integer(const Node* self) {
+    if self.kind != Kind::Integer {
+        return Optional::None;
+    }
+
+    return Optional::Some(self.integer);
+}
+
+/// an `Integer` widens here; a `Float` never narrows the other way.
+public Optional(f64) as_float(const Node* self) {
+    if self.kind == Kind::Float {
+        return Optional::Some(self.number);
+    }
+
+    if self.kind == Kind::Integer {
+        return Optional::Some(self.integer as f64);
+    }
+
+    return Optional::None;
+}
+
+public Optional(bool) as_bool(const Node* self) {
+    if self.kind != Kind::Bool {
+        return Optional::None;
+    }
+
+    return Optional::Some(self.boolean);
+}
+
+/// the codepoint of a character literal.
+public Optional(u32) as_char(const Node* self) {
+    if self.kind != Kind::Char {
+        return Optional::None;
+    }
+
+    return Optional::Some(self.integer as u32);
+}
+
+/// the path of an enum value as written, such as `dpm::v1::Kind::Executable`.
+public Optional([] const char) as_enum(const Node* self) {
+    if self.kind != Kind::Enum {
+        return Optional::None;
+    }
+
+    return Optional::Some(self.text);
+}
+
+/// the last segment of an enum value's path: `Executable` for
+/// `Kind::Executable` however far the path is qualified.
+public Optional([] const char) variant(const Node* self) {
+    if self.kind != Kind::Enum {
+        return Optional::None;
+    }
+
+    usize start = self.text.len;
+    while start > 0 && self.text[start - 1] != ':' {
+        start = start - 1;
+    }
+
+    return Optional::Some(self.text[start..self.text.len]);
+}
+
+/// true for an enum value whose last path segment is `name`.
+public bool is_variant(const Node* self, [] const char name) {
+    Optional([] const char) last = variant(self);
+    return last.is_some() && text_eq(last.unwrap_some(), name);
+}
+
+/// the type path written before a struct literal, or nothing.
+public [] const char type_name(const Node* self) {
+    if self.kind != Kind::Struct {
+        return "";
+    }
+
+    return self.text;
+}
+
+/// the string field `name` of a struct.
+public Optional([] const char) get_string(const Node* self, [] const char name) {
+    Optional(const Node*) field = get(self, name);
+    if field.is_none() {
+        return Optional::None;
+    }
+
+    return as_string(field.unwrap_some());
+}
+
+/// the integer field `name` of a struct.
+public Optional(i64) get_integer(const Node* self, [] const char name) {
+    Optional(const Node*) field = get(self, name);
+    if field.is_none() {
+        return Optional::None;
+    }
+
+    return as_integer(field.unwrap_some());
+}
+
+/// the float field `name` of a struct; an integer widens.
+public Optional(f64) get_float(const Node* self, [] const char name) {
+    Optional(const Node*) field = get(self, name);
+    if field.is_none() {
+        return Optional::None;
+    }
+
+    return as_float(field.unwrap_some());
+}
+
+/// the bool field `name` of a struct.
+public Optional(bool) get_bool(const Node* self, [] const char name) {
+    Optional(const Node*) field = get(self, name);
+    if field.is_none() {
+        return Optional::None;
+    }
+
+    return as_bool(field.unwrap_some());
+}
+
+//!
+//! Emitting
+//!
+//! Generic over the writer concept, so a file, a buffer and a growable
+//! `Array(char)` all work. The output parses back to an equal tree.
+//!
+
+char hex_digit(u32 value) {
+    if value < 10 {
+        return (0x30 + value) as u8 as char;
+    }
+
+    return (0x61 + value - 10) as u8 as char;
+}
+
+/// writes `text` as a quoted string literal.
+public Status(std::fmt::FormatError(std::fmt::WriterError(W))) write_string(W)(
+    W* out,
+    [] const char text
+) if std::fmt::Writer(
+    W
+) {
+    out.write_byte('"') ?;
+
+    usize run = 0;
+    usize i = 0;
+
+    while i < text.len {
+        char c = text[i];
+        u32 b = c as u32;
+
+        if b >= 0x80 {
+            // a whole sequence passes through; a stray byte is escaped
+            Result(std::utf8::Decoded, std::utf8::Utf8Error) decoded = std::utf8::decode(
+                text[i..text.len]
+            );
+            if decoded.is_ok() {
+                i = i + decoded.unwrap().width;
+                continue;
+            }
+        } else if b >= 0x20 && b != 0x7F && c != '"' && c != '\\' {
+            i++;
+            continue;
+        }
+
+        out.write_all(text[run..i]) ?;
+
+        if c == '"' {
+            out.write_all("\\\"") ?;
+        } else if c == '\\' {
+            out.write_all("\\\\") ?;
+        } else if c == '\n' {
+            out.write_all("\\n") ?;
+        } else if c == '\t' {
+            out.write_all("\\t") ?;
+        } else if c == '\r' {
+            out.write_all("\\r") ?;
+        } else {
+            char[4] escape = {'\\', 'x', hex_digit(b >> 4), hex_digit(b & 15)};
+            out.write_all(escape) ?;
+        }
+
+        i++;
+        run = i;
+    }
+
+    out.write_all(text[run..text.len]) ?;
+    out.write_byte('"') ?;
+    return Status::Ok;
+}
+
+Status(std::fmt::FormatError(std::fmt::WriterError(W))) write_char(W)(
+    W* out,
+    u32 value
+) if std::fmt::Writer(
+    W
+) {
+    out.write_byte('\'') ?;
+
+    if value == 0x27 {
+        out.write_all("\\'") ?;
+    } else if value == 0x5C {
+        out.write_all("\\\\") ?;
+    } else if value == 0x0A {
+        out.write_all("\\n") ?;
+    } else if value == 0x09 {
+        out.write_all("\\t") ?;
+    } else if value == 0x0D {
+        out.write_all("\\r") ?;
+    } else if value >= 0x20 && value < 0x7F {
+        out.write_byte(value as u8 as char) ?;
+    } else if value < 0x100 {
+        char[4] escape = {'\\', 'x', hex_digit(value >> 4), hex_digit(value & 15)};
+        out.write_all(escape) ?;
+    } else {
+        out.write_all("\\u{") ?;
+        std::fmt::Options options = std::fmt::default_options();
+        options.base = 16;
+        std::fmt::format_unsigned(out, value as u64, &options) ?;
+        out.write_byte('}') ?;
+    }
+
+    out.write_byte('\'') ?;
+    return Status::Ok;
+}
+
+/// formats `magnitude` into `buffer` with the fewest digits that this
+/// module reads back as the same value. None when no precision does.
+Optional(usize) render_float([] char buffer, f64 magnitude, bool scientific) {
+    for usize precision = 1; precision <= 17; precision++ {
+        std::fmt::BufferWriter staged = std::fmt::new_buffer_writer(buffer);
+        std::fmt::Options options = std::fmt::default_options();
+        options.precision = precision;
+        options.scientific = scientific;
+
+        if !std::fmt::format_float(&staged, magnitude, &options).is_ok() {
+            continue;
+        }
+
+        Result(f64, std::parse::NumError) back = float_value(
+            staged.written_slice()
+        );
+        if back.is_ok() && back.unwrap() == magnitude {
+            return Optional::Some(staged.written);
+        }
+    }
+
+    return Optional::None;
+}
+
+/// writes a float literal: plain digits for everyday magnitudes, an
+/// exponent otherwise. conversion is `std::fmt`'s and `std::parse`'s, so a
+/// value that needs all 17 digits may come back off in its last places.
+Status(std::fmt::FormatError(std::fmt::WriterError(W))) write_float(W)(
+    W* out,
+    f64 value
+) if std::fmt::Writer(
+    W
+) {
+    f64 magnitude = value;
+    if value < 0.0 {
+        magnitude = -value;
+        out.write_byte('-') ?;
+    }
+
+    char[400] buffer;
+    Optional(usize) length = Optional::None;
+
+    if magnitude == 0.0 || (magnitude >= 0.0001 && magnitude < 1.0e15) {
+        length = render_float(buffer[0..400], magnitude, false);
+    }
+    if length.is_none() {
+        length = render_float(buffer[0..400], magnitude, true);
+    }
+
+    if length.is_some() {
+        out.write_all(buffer[0..length.unwrap_some()]) ?;
+        return Status::Ok;
+    }
+
+    std::fmt::Options options = std::fmt::default_options();
+    options.precision = 17;
+    options.scientific = true;
+    return std::fmt::format_float(out, magnitude, &options);
+}
+
+Status(std::fmt::FormatError(std::fmt::WriterError(W))) write_break(W)(
+    W* out,
+    u32 indent,
+    usize depth
+) if std::fmt::Writer(
+    W
+) {
+    if indent == 0 {
+        out.write_byte(' ') ?;
+        return Status::Ok;
+    }
+
+    out.write_byte('\n') ?;
+    out.write_repeat(' ', depth * indent as usize) ?;
+    return Status::Ok;
+}
+
+Status(std::fmt::FormatError(std::fmt::WriterError(W))) write_node(W)(
+    W* out,
+    const Node* node,
+    u32 indent,
+    usize depth
+) if std::fmt::Writer(
+    W
+) {
+    if node.kind == Kind::String {
+        return write_string(out, node.text);
+    }
+
+    if node.kind == Kind::Integer {
+        std::fmt::Options options = std::fmt::default_options();
+        std::fmt::format_signed(out, node.integer, &options) ?;
+        return Status::Ok;
+    }
+
+    if node.kind == Kind::Float {
+        return write_float(out, node.number);
+    }
+
+    if node.kind == Kind::Bool {
+        out.write_all(
+            if node.boolean {
+                "true"
+            } else {
+                "false"
+            }
+        ) ?;
+        return Status::Ok;
+    }
+
+    if node.kind == Kind::Char {
+        return write_char(out, node.integer as u32);
+    }
+
+    if node.kind == Kind::Enum {
+        out.write_all(node.text) ?;
+        return Status::Ok;
+    }
+
+    if node.kind == Kind::Struct && node.text.len != 0 {
+        out.write_all(node.text) ?;
+        out.write_byte(' ') ?;
+    }
+
+    usize count = len(node);
+    if count == 0 {
+        out.write_all("{}") ?;
+        return Status::Ok;
+    }
+
+    out.write_byte('{') ?;
+
+    for usize i = 0; i < count; i++ {
+        write_break(out, indent, depth + 1) ?;
+
+        if node.kind == Kind::Struct {
+            if node.fields[i].name.len != 0 {
+                out.write_all(node.fields[i].name) ?;
+                out.write_all(" = ") ?;
+            }
+            write_node(out, &node.fields[i].value, indent, depth + 1) ?;
+        } else {
+            write_node(out, &node.items[i], indent, depth + 1) ?;
+        }
+
+        if indent != 0 || i + 1 < count {
+            out.write_byte(',') ?;
+        }
+    }
+
+    write_break(out, indent, depth) ?;
+    out.write_byte('}') ?;
+    return Status::Ok;
+}
+
+/// renders `node` as DCON. `indent` is the number of spaces per level; 0
+/// writes everything on one line.
+public Status(std::fmt::FormatError(std::fmt::WriterError(W))) write(W)(
+    W* out,
+    const Node* node,
+    u32 indent
+) if std::fmt::Writer(
+    W
+) {
+    return write_node(out, node, indent, 0);
+}
